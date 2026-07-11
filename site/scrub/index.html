@@ -17,6 +17,8 @@
   <meta name="twitter:title" content="PureAutoLike — Не жми. Веди.">
   <meta name="twitter:description" content="Автолайк для Pure Web в интерактивной motion-кампании PureAutoLike.">
   <meta name="twitter:image" content="https://zgnme.github.io/pureautolike/assets/posters/interactive-scrub-greenscreen-poster-1440-clean.png">
+  <link rel="preload" as="image" href="../assets/posters/interactive-scrub-poster-desktop-900.png?v=pages4" media="(min-width: 768px)" fetchpriority="high">
+  <link rel="preload" as="image" href="../assets/posters/interactive-scrub-poster-mobile-540.png?v=pages4" media="(max-width: 767px)" fetchpriority="high">
   <style>
     *,
     *::before,
@@ -581,7 +583,7 @@
         <video
           id="scrubVideo"
           class="scrub-video"
-          poster="../assets/posters/interactive-scrub-poster-desktop-900.png?v=pages2"
+          poster="../assets/posters/interactive-scrub-poster-desktop-900.png?v=pages4"
           preload="metadata"
           muted
           playsinline
@@ -613,8 +615,8 @@
     const compactMedia = window.matchMedia('(max-width: 767px)');
     const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     const SEEK_EPSILON = 1 / 60;
-    const FOLLOW_RESPONSE = 7.5;
-    const MAX_FOLLOW_SPEED_RATIO = 0.38;
+    const FOLLOW_RESPONSE = 6;
+    const MAX_FOLLOW_SPEED_RATIO = 0.28;
     const SNAP_DISTANCE = 1 / 240;
     const VIDEO_SOURCES = {
       safariAlpha: {
@@ -639,8 +641,8 @@
       }
     };
     const VIDEO_POSTERS = {
-      desktop: '../assets/posters/interactive-scrub-poster-desktop-900.png?v=pages2',
-      mobile: '../assets/posters/interactive-scrub-poster-mobile-540.png?v=pages2'
+      desktop: '../assets/posters/interactive-scrub-poster-desktop-900.png?v=pages4',
+      mobile: '../assets/posters/interactive-scrub-poster-mobile-540.png?v=pages4'
     };
 
     let duration = 0;
@@ -795,6 +797,9 @@
       wordmark.style.setProperty('--wordmark-shift', '0px');
       wordmark.style.setProperty('--wordmark-tilt', '0deg');
       video.pause();
+      if (duration && Math.abs(video.currentTime - smoothTime) > SEEK_EPSILON) {
+        video.currentTime = smoothTime;
+      }
       paintProgress();
     }
 
