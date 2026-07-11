@@ -2,14 +2,13 @@
 import {mkdir, writeFile} from 'node:fs/promises';
 import {createWriteStream} from 'node:fs';
 import {relative, resolve, join} from 'node:path';
-import {assertFixtureSafe, sanitizeProtocolEvent} from './pure-protocol-sanitize.mjs';
+import {buildSafeProtocolFixture} from './pure-protocol-sanitize.mjs';
 
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 9222;
 const DEFAULT_DURATION_MS = 90_000;
 const BODY_TEXT_LIMIT = 192 * 1024;
 const MAX_EVENTS_IN_MEMORY = 4000;
-const MAX_FIXTURE_EVENTS = 400;
 const ANALYSIS_ROOT = resolve('analysis');
 
 const args = parseArgs(process.argv.slice(2));
@@ -64,6 +63,7 @@ const out = createWriteStream(files.events, {flags: 'w'});
 
 let cdp;
 let stopping = false;
+let outputClosed = false;
 let stopTimer = null;
 let keepAliveTimer = null;
 let resolveStopped;
@@ -124,35 +124,45 @@ async function stop(reason) {
   stopping = true;
   if (stopTimer) clearTimeout(stopTimer);
   try {
-    if (cdp) {
-      await withTimeout(captureResourceSnapshot(cdp), 3000, 'resource snapshot timeout')
-        .catch(() => withTimeout(captureFreshResourceSnapshots(), 7000, 'fresh resource snapshot timeout'));
+    try {
+      if (cdp) {
+        await withTimeout(captureResourceSnapshot(cdp), 3000, 'resource snapshot timeout')
+          .catch(() => withTimeout(captureFreshResourceSnapshots(), 7000, 'fresh resource snapshot timeout'));
+      }
+    } catch (error) {
+      writeEvent({
+        kind: 'listener_error',
+        ts: new Date().toISOString(),
+        error: `resource snapshot failed: ${error.message || error}`
+      });
     }
+    const summary = buildSummary(reason);
+    await writeFile(files.summary, `${JSON.stringify(summary, null, 2)}\n`);
+    await writeFile(files.report, renderReport(summary));
+    const fixture = buildSafeProtocolFixture(state.events);
+    await writeFile(files.fixture, `${JSON.stringify(fixture)}\n`);
+    console.log(`summary: ${files.summary}`);
+    console.log(`report: ${files.report}`);
+    console.log(`fixture: ${files.fixture}`);
   } catch (error) {
-    writeEvent({
-      kind: 'listener_error',
-      ts: new Date().toISOString(),
-      error: `resource snapshot failed: ${error.message || error}`
+    console.error(`listener shutdown failed: ${error.message || error}`);
+    process.exitCode = 1;
+  } finally {
+    try {
+      if (cdp) cdp.close();
+    } catch (_) {}
+    await closeOutput().catch(error => {
+      console.error(`listener output close failed: ${error.message || error}`);
+      process.exitCode = 1;
     });
+    if (keepAliveTimer) clearInterval(keepAliveTimer);
+    if (resolveStopped) resolveStopped();
   }
-  try {
-    if (cdp) cdp.close();
-  } catch (_) {}
-  const summary = buildSummary(reason);
-  await writeFile(files.summary, `${JSON.stringify(summary, null, 2)}\n`);
-  await writeFile(files.report, renderReport(summary));
-  const fixture = buildSafeFixture();
-  assertFixtureSafe(fixture);
-  await writeFile(files.fixture, `${JSON.stringify(fixture, null, 2)}\n`);
-  await closeOutput();
-  console.log(`summary: ${files.summary}`);
-  console.log(`report: ${files.report}`);
-  console.log(`fixture: ${files.fixture}`);
-  if (keepAliveTimer) clearInterval(keepAliveTimer);
-  if (resolveStopped) resolveStopped();
 }
 
 async function closeOutput() {
+  if (outputClosed) return;
+  outputClosed = true;
   await new Promise(resolveDone => out.end(resolveDone));
 }
 
@@ -326,6 +336,7 @@ function onRequest(params) {
     requestId: params.requestId,
     method: String(request.method || 'GET').toUpperCase(),
     url,
+    requestHeaderNames: Object.keys(request.headers || {}).sort(),
     requestPayload: summarizePayloadText(request.postData || ''),
     startedAt: new Date().toISOString()
   };
@@ -345,6 +356,7 @@ function onResponse(params) {
     mimeType: response.mimeType || '',
     resourceType: params.type || '',
     remoteIPAddress: response.remoteIPAddress || '',
+    responseHeaderNames: Object.keys(response.headers || {}).sort(),
     responseHeaders: summarizeHeaders(response.headers || {})
   });
 }
@@ -385,6 +397,8 @@ async function onFinished(params) {
     status: item.status || 0,
     resourceType: item.resourceType || '',
     contentType: item.mimeType || item.responseHeaders?.contentType || '',
+    requestHeaderNames: item.requestHeaderNames,
+    responseHeaderNames: item.responseHeaderNames,
     requestPayload: item.requestPayload,
     responseSummary: bodySummary,
     signals: mergeSignals(signals, signalsForUrl(item.url, item.status || 0))
@@ -898,19 +912,6 @@ function buildSummary(reason) {
     geo: geo.slice(0, 80),
     visibility: visibility.slice(0, 80),
     engagement: engagement.slice(0, 80)
-  };
-}
-
-function buildSafeFixture() {
-  const events = [];
-  for (const event of state.events) {
-    if (!event.host || events.length >= MAX_FIXTURE_EVENTS) continue;
-    events.push(sanitizeProtocolEvent(event));
-  }
-  return {
-    schemaVersion: 1,
-    events,
-    truncated: state.events.filter(event => event.host).length > events.length
   };
 }
 

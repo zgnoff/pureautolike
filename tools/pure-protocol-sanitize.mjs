@@ -3,7 +3,15 @@ const MAX_DEPTH = 5;
 const MAX_KEYS = 40;
 const MAX_ARRAY_ITEMS = 20;
 const MAX_FIXTURE_ITEMS = 400;
-const MAX_FIXTURE_BYTES = 64 * 1024;
+export const PROTOCOL_FIXTURE_MAX_BYTES = 64 * 1024;
+
+const STATIC_PATH_SEGMENTS = new Set([
+  'api', 'assets', 'auth', 'blocks', 'boosts', 'chat', 'chats', 'cities', 'connection',
+  'countries', 'events', 'feed', 'feeds', 'geo', 'like', 'likes', 'location', 'locations',
+  'match', 'matches', 'me', 'media', 'message', 'messages', 'moderation', 'notifications',
+  'profile', 'profiles', 'reactions', 'search', 'session', 'settings', 'subscriptions',
+  'upload', 'user', 'users', 'ws', 'websocket'
+]);
 
 const UNSAFE_VALUE_PATTERNS = [
   /\bbearer\s+[a-z0-9._~+\/-]+=*/i,
@@ -24,13 +32,40 @@ export function sanitizeProtocolEvent(event) {
     host: location.host,
     path: generalizePath(location.path),
     queryKeys: location.queryKeys,
-    requestHeaderNames: headerNames(event.requestHeaders || event.headers || event.request?.headers),
-    responseHeaderNames: headerNames(event.response?.headers),
-    requestBody: shapeOf(firstDefined(event.requestBody, event.request?.body, event.request?.postData, event.body)),
-    response: sanitizeResponse(event.response),
+    requestHeaderNames: headerNames(event.requestHeaderNames || event.requestHeaders || event.headers || event.request?.headers),
+    responseHeaderNames: headerNames(event.responseHeaderNames || event.response?.headers),
+    requestBody: event.requestPayload !== undefined ? shapeFromSummary(event.requestPayload) :
+      shapeOf(firstDefined(event.requestBody, event.request?.body, event.request?.postData, event.body)),
+    response: sanitizeResponse(event.response, event.responseSummary),
     status: normalizeStatus(event.status)
   });
 
+  assertFixtureSafe(fixture);
+  return fixture;
+}
+
+export function buildSafeProtocolFixture(rawEvents) {
+  const source = Array.isArray(rawEvents) ? rawEvents.filter(event => event?.host) : [];
+  const fixture = {schemaVersion: 1, events: [], truncated: false};
+
+  for (let index = 0; index < source.length; index += 1) {
+    if (fixture.events.length >= MAX_FIXTURE_ITEMS) {
+      fixture.truncated = true;
+      break;
+    }
+    const event = sanitizeProtocolEvent(source[index]);
+    const candidate = {
+      ...fixture,
+      events: [...fixture.events, event],
+      truncated: index < source.length - 1
+    };
+    if (serializedBytes(candidate) + 1 > PROTOCOL_FIXTURE_MAX_BYTES) {
+      fixture.truncated = true;
+      break;
+    }
+    fixture.events.push(event);
+  }
+  fixture.truncated ||= fixture.events.length < source.length;
   assertFixtureSafe(fixture);
   return fixture;
 }
@@ -42,7 +77,7 @@ export function assertFixtureSafe(value) {
   } catch (_) {
     throw new Error('Unsafe fixture: value is not JSON serializable');
   }
-  if (serialized === undefined || serialized.length > MAX_FIXTURE_BYTES) {
+  if (serialized === undefined || Buffer.byteLength(serialized, 'utf8') > PROTOCOL_FIXTURE_MAX_BYTES) {
     throw new Error('Unsafe fixture: size limit exceeded');
   }
   for (const pattern of UNSAFE_VALUE_PATTERNS) {
@@ -90,7 +125,9 @@ function generalizePath(path) {
     if (/^\d{6,}$/.test(decoded)) return ':id';
     if (/^[a-f0-9]{16,}$/i.test(decoded)) return ':id';
     if (/^[A-Za-z0-9_-]{24,}$/.test(decoded)) return ':id';
-    return decoded.slice(0, 80);
+    const lower = decoded.toLowerCase();
+    if (/^v\d{1,2}$/.test(lower) || STATIC_PATH_SEGMENTS.has(lower)) return lower;
+    return ':segment';
   });
   return segments.join('/') || '/';
 }
@@ -116,7 +153,8 @@ function normalizeKey(value) {
 }
 
 function headerNames(headers) {
-  if (!headers || typeof headers !== 'object' || Array.isArray(headers)) return undefined;
+  if (Array.isArray(headers)) return uniqueSorted(headers.slice(0, MAX_KEYS).map(normalizeKey));
+  if (!headers || typeof headers !== 'object') return undefined;
   return uniqueSorted(Object.keys(headers).slice(0, MAX_KEYS).map(normalizeKey));
 }
 
@@ -125,12 +163,43 @@ function uniqueSorted(values) {
   return result.length ? result.slice(0, MAX_KEYS) : undefined;
 }
 
-function sanitizeResponse(response) {
+function sanitizeResponse(response, responseSummary) {
+  if (responseSummary !== undefined) {
+    return compact({status: normalizeStatus(response?.status), body: shapeFromSummary(responseSummary)});
+  }
   if (!response || typeof response !== 'object' || Array.isArray(response)) return undefined;
   return compact({
     status: normalizeStatus(response.status),
     body: shapeOf(firstDefined(response.body, response.data))
   });
+}
+
+function shapeFromSummary(summary, depth = 0) {
+  if (!summary || typeof summary !== 'object' || Array.isArray(summary)) return shapeOf(summary, depth);
+  const type = typeof summary.type === 'string' ? summary.type : undefined;
+  if (!['array', 'boolean', 'null', 'number', 'object', 'string', 'undefined'].includes(type)) {
+    return shapeOf(summary, depth);
+  }
+  if (type === 'array') {
+    const sampleType = summary.sample?.type;
+    return compact({
+      type: 'array',
+      itemTypes: typeof sampleType === 'string' ? uniqueSorted([sampleType]) : undefined
+    });
+  }
+  if (type !== 'object') return {type};
+
+  const rawKeys = Array.isArray(summary.keys) ? summary.keys.slice(0, MAX_KEYS).map(String) :
+    Object.keys(summary.fields || {}).slice(0, MAX_KEYS);
+  const keys = rawKeys.map(sanitizeFieldKey);
+  const fields = {};
+  if (depth < MAX_DEPTH) {
+    for (let index = 0; index < rawKeys.length; index += 1) {
+      const child = summary.fields?.[rawKeys[index]];
+      if (child !== undefined) fields[keys[index]] = shapeFromSummary(child, depth + 1);
+    }
+  }
+  return compact({type: 'object', keys: uniqueSorted(keys), fields: depth < MAX_DEPTH ? fields : undefined});
 }
 
 function shapeOf(value, depth = 0) {
@@ -174,6 +243,10 @@ function typeName(value) {
 
 function firstDefined(...values) {
   return values.find(value => value !== undefined);
+}
+
+function serializedBytes(value) {
+  return Buffer.byteLength(JSON.stringify(value), 'utf8');
 }
 
 function compact(value) {

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import {
   assertFixtureSafe,
+  buildSafeProtocolFixture,
+  PROTOCOL_FIXTURE_MAX_BYTES,
   sanitizeProtocolEvent
 } from '../tools/pure-protocol-sanitize.mjs';
 
@@ -96,6 +98,66 @@ const bounded = sanitizeProtocolEvent({
 });
 assert.ok(JSON.stringify(bounded).length < 5000);
 assert.doesNotThrow(() => assertFixtureSafe(bounded));
+
+const adversarialPath = sanitizeProtocolEvent({
+  method: 'GET',
+  url: 'https://pure.app/v2/users/Fixture%20Person/messages/fixture%20private%20message/abc123'
+});
+assert.equal(adversarialPath.path, '/v2/users/:segment/messages/:segment/:segment');
+for (const seed of seeds.slice(2)) {
+  assert.equal(decodeURIComponent(adversarialPath.path).includes(seed), false);
+}
+
+const listenerShaped = sanitizeProtocolEvent({
+  kind: 'http',
+  method: 'PATCH',
+  host: 'api.pure.app',
+  path: '/v2/profiles/98765432109876543210',
+  queryKeys: ['token', 'radius'],
+  requestHeaderNames: ['X-Trace-ID', 'Authorization', 'Cookie'],
+  responseHeaderNames: ['Content-Type', 'Set-Cookie'],
+  requestPayload: {
+    type: 'object',
+    keys: ['profile', 'message'],
+    fields: {
+      profile: {type: 'object', keys: ['id', 'name'], fields: {id: {type: 'string'}, name: {type: 'string'}}},
+      message: {type: 'string', length: 23}
+    }
+  },
+  responseSummary: {
+    type: 'object',
+    keys: ['ok', 'result'],
+    fields: {
+      ok: {type: 'boolean', value: true},
+      result: {type: 'object', keys: ['code'], fields: {code: {type: 'number', value: 201}}}
+    }
+  },
+  status: 200
+});
+assert.deepEqual(listenerShaped.requestHeaderNames, ['authorization', 'cookie', 'x-trace-id']);
+assert.deepEqual(listenerShaped.responseHeaderNames, ['content-type', 'set-cookie']);
+assert.deepEqual(listenerShaped.requestBody.fields.profile.fields.name, {type: 'string'});
+assert.deepEqual(listenerShaped.response.body.fields.result.fields.code, {type: 'number'});
+assert.doesNotThrow(() => assertFixtureSafe(listenerShaped));
+
+const wideSummary = {
+  type: 'object',
+  keys: Array.from({length: 40}, (_, index) => `field${index}`),
+  fields: Object.fromEntries(Array.from({length: 40}, (_, index) => [`field${index}`, {type: 'string'}]))
+};
+const oversizedEvents = Array.from({length: 400}, (_, index) => ({
+  kind: 'http',
+  method: 'POST',
+  host: 'api.pure.app',
+  path: `/v2/messages/${index + 100000}`,
+  requestPayload: wideSummary,
+  responseSummary: wideSummary,
+  status: 200
+}));
+const sizeBoundedFixture = buildSafeProtocolFixture(oversizedEvents);
+assert.ok(Buffer.byteLength(`${JSON.stringify(sizeBoundedFixture)}\n`, 'utf8') <= PROTOCOL_FIXTURE_MAX_BYTES);
+assert.equal(sizeBoundedFixture.truncated, true);
+assert.doesNotThrow(() => assertFixtureSafe(sizeBoundedFixture));
 
 assert.throws(
   () => sanitizeProtocolEvent({method: 'GET', url: 'https://example.com/api/feed'}),
