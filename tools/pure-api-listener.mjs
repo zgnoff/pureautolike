@@ -2,12 +2,15 @@
 import {mkdir, writeFile} from 'node:fs/promises';
 import {createWriteStream} from 'node:fs';
 import {relative, resolve, join} from 'node:path';
+import {assertFixtureSafe, sanitizeProtocolEvent} from './pure-protocol-sanitize.mjs';
 
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 9222;
 const DEFAULT_DURATION_MS = 90_000;
 const BODY_TEXT_LIMIT = 192 * 1024;
 const MAX_EVENTS_IN_MEMORY = 4000;
+const MAX_FIXTURE_EVENTS = 400;
+const ANALYSIS_ROOT = resolve('analysis');
 
 const args = parseArgs(process.argv.slice(2));
 
@@ -16,11 +19,14 @@ if (args.help) {
   process.exit(0);
 }
 
+const requestedOutDir = resolve(String(args.out || 'analysis/pure-api-listener'));
+assertAnalysisOutput(requestedOutDir);
+
 const config = {
   host: String(args.host || DEFAULT_HOST),
   port: Number(args.port || DEFAULT_PORT),
   target: String(args.target || 'pure.app'),
-  outDir: resolve(String(args.out || 'analysis/pure-api-listener')),
+  outDir: requestedOutDir,
   durationMs: Number(args.duration ?? DEFAULT_DURATION_MS),
   reload: Boolean(args.reload),
   includeResponseBodies: args.bodies !== false,
@@ -31,7 +37,8 @@ const runId = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '').
 const files = {
   events: join(config.outDir, `events-${runId}.ndjson`),
   summary: join(config.outDir, `summary-${runId}.json`),
-  report: join(config.outDir, `report-${runId}.md`)
+  report: join(config.outDir, `report-${runId}.md`),
+  fixture: join(config.outDir, `fixture-${runId}.json`)
 };
 const fileLabels = Object.fromEntries(
   Object.entries(files).map(([key, value]) => [key, relative(process.cwd(), value)])
@@ -134,9 +141,13 @@ async function stop(reason) {
   const summary = buildSummary(reason);
   await writeFile(files.summary, `${JSON.stringify(summary, null, 2)}\n`);
   await writeFile(files.report, renderReport(summary));
+  const fixture = buildSafeFixture();
+  assertFixtureSafe(fixture);
+  await writeFile(files.fixture, `${JSON.stringify(fixture, null, 2)}\n`);
   await closeOutput();
   console.log(`summary: ${files.summary}`);
   console.log(`report: ${files.report}`);
+  console.log(`fixture: ${files.fixture}`);
   if (keepAliveTimer) clearInterval(keepAliveTimer);
   if (resolveStopped) resolveStopped();
 }
@@ -195,11 +206,18 @@ Options:
   --port <port>          CDP port, default 9222
   --target <text>        Pick a page target whose URL/title contains text, default pure.app
   --duration <ms>        Capture time in milliseconds. Use 0 for Ctrl-C mode
-  --out <dir>            Output directory, default analysis/pure-api-listener
+  --out <dir>            Raw output directory under gitignored analysis/
   --reload               Reload the selected Pure tab after attaching
   --no-bodies            Do not request response bodies from CDP
   --no-geo-values        Keep geo field names only, without coarse values
 `);
+}
+
+function assertAnalysisOutput(outDir) {
+  const pathFromAnalysis = relative(ANALYSIS_ROOT, outDir);
+  if (pathFromAnalysis === '..' || pathFromAnalysis.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) || resolve(outDir) === ANALYSIS_ROOT) {
+    throw new Error('Raw listener output must be a subdirectory of analysis/');
+  }
 }
 
 async function fetchJson(url) {
@@ -880,6 +898,19 @@ function buildSummary(reason) {
     geo: geo.slice(0, 80),
     visibility: visibility.slice(0, 80),
     engagement: engagement.slice(0, 80)
+  };
+}
+
+function buildSafeFixture() {
+  const events = [];
+  for (const event of state.events) {
+    if (!event.host || events.length >= MAX_FIXTURE_EVENTS) continue;
+    events.push(sanitizeProtocolEvent(event));
+  }
+  return {
+    schemaVersion: 1,
+    events,
+    truncated: state.events.filter(event => event.host).length > events.length
   };
 }
 
