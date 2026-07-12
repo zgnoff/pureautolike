@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {readFile} from 'node:fs/promises';
 import test from 'node:test';
 
 import {authorize, confirmationBinding, createRegistry, CORE_TOOL_DEFINITIONS} from '../src/index.js';
@@ -23,6 +24,15 @@ async function rejectsWithoutLeak(promise, code, secrets = []) {
 test('allows authorized reads without confirmation', async () => {
   const definition = registry.get('pure.chats.list');
   await assert.doesNotReject(authorize(definition, {}, context));
+});
+
+test('accepts transparent proxies that yield safe own-data snapshots', async () => {
+  const definition = registry.get('pure.chats.list');
+  await assert.doesNotReject(authorize(definition, {}, new Proxy({...context}, {})));
+  await assert.doesNotReject(authorize(definition, {}, {
+    ...context,
+    scopes: new Proxy(['pure:read'], {})
+  }));
 });
 
 test('denies missing scopes before executor selection', async () => {
@@ -87,7 +97,7 @@ test('rejects malformed caller context without leaking supplied values', async (
   });
 });
 
-test('sanitizes null, accessor, proxy, inherited, and hostile-scope contexts', async () => {
+test('sanitizes null, accessor, revoked, throwing-proxy, inherited, and hostile-scope contexts', async () => {
   const definition = registry.get('pure.chats.list');
   const secret = 'fixture-hostile-context-secret';
   let callerGetterCalled = false;
@@ -100,7 +110,8 @@ test('sanitizes null, accessor, proxy, inherited, and hostile-scope contexts', a
     }
   });
   const proxyContext = new Proxy({}, {ownKeys() { throw new Error(secret); }});
-  const transparentProxyContext = new Proxy({...context}, {});
+  const revokedContext = Proxy.revocable({...context}, {});
+  revokedContext.revoke();
   const inheritedContext = Object.create(context);
 
   let scopeGetterCalled = false;
@@ -120,19 +131,17 @@ test('sanitizes null, accessor, proxy, inherited, and hostile-scope contexts', a
   });
   const sparseScopes = new Array(1);
   const proxyScopes = new Proxy(['pure:read'], {ownKeys() { throw new Error(secret); }});
-  const transparentProxyScopes = new Proxy(['pure:read'], {});
 
   const hostile = [
     null,
     accessorContext,
     proxyContext,
-    transparentProxyContext,
+    revokedContext.proxy,
     inheritedContext,
     {...context, scopes: accessorScopes},
     {...context, scopes: customScopes},
     {...context, scopes: sparseScopes},
-    {...context, scopes: proxyScopes},
-    {...context, scopes: transparentProxyScopes}
+    {...context, scopes: proxyScopes}
   ];
   for (const value of hostile) {
     await rejectsWithoutLeak(authorize(definition, {}, value), 'permission_denied', [secret]);
@@ -184,4 +193,9 @@ test('distinguishes positive and negative zero in confirmation bindings', () => 
   };
   assert.notEqual(confirmationBinding({...input, args: {value: 0}}),
     confirmationBinding({...input, args: {value: -0}}));
+});
+
+test('keeps production policy free of Node runtime imports', async () => {
+  const source = await readFile(new URL('../src/policy.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /(?:from\s+|import\s*\()['"]node:/);
 });

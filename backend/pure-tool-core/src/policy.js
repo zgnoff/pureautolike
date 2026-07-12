@@ -1,5 +1,3 @@
-import {types} from 'node:util';
-
 import {toolError} from './errors.js';
 
 function validIdentity(value) {
@@ -24,7 +22,7 @@ function ownData(descriptors, key) {
 }
 
 function snapshotScopes(value) {
-  if (types.isProxy(value) || !Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
     return null;
   }
   const descriptors = Object.getOwnPropertyDescriptors(value);
@@ -44,7 +42,7 @@ function snapshotScopes(value) {
 
 function snapshotContext(context) {
   try {
-    if (!context || typeof context !== 'object' || types.isProxy(context) || Array.isArray(context)) return null;
+    if (!context || typeof context !== 'object' || Array.isArray(context)) return null;
     const prototype = Object.getPrototypeOf(context);
     if (prototype !== Object.prototype && prototype !== null) return null;
     const descriptors = Object.getOwnPropertyDescriptors(context);
