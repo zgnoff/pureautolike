@@ -125,7 +125,7 @@ test('creates frozen success results with stable metadata', () => {
 });
 
 test('does not echo provider text through external failures', () => {
-  const secret = 'Bearer fixture-secret-must-not-escape';
+  const secret = 'fixture-auth-secret-must-not-escape';
   const error = toolError('provider_rejected', {retryable: false, cause: new Error(secret)});
   assert(error instanceof ToolCoreError);
   const result = failure(error, {requestId: 'req-2'});
@@ -776,7 +776,7 @@ test('binds dangerous confirmation to exact caller, account, operation, and argu
 });
 
 test('rejects malformed caller context without leaking supplied values', async () => {
-  const secret = 'Bearer policy-secret';
+  const secret = 'fixture-policy-secret';
   const definition = registry.get('pure.chats.list');
   await assert.rejects(authorize(definition, {}, {callerId: secret, accountId: '', scopes: []}), error => {
     assert.equal(error.code, 'permission_denied');
@@ -1103,7 +1103,7 @@ test('returns honest capability and not-implemented results', async () => {
 
 test('audits metadata without arguments, results, identifiers, or secrets', async () => {
   const events = [];
-  const secret = 'Bearer end-to-end-secret';
+  const secret = 'fixture-end-to-end-secret';
   const core = createToolCore({
     definitions: definitionsWith('pure.discovery.profile.get'),
     requestId: () => 'req-3',
