@@ -110,14 +110,10 @@ async function authenticate(request, env, url, bodyBytes, now) {
     WHERE expires_at <= ?
   `).bind(nowIso).run();
   const inserted = await env.DB.prepare(`
-    INSERT INTO bridge_gateway_nonces (nonce_hash, account_id, signed_at, expires_at, consumed_at)
-    SELECT ?, id, ?, strftime('%Y-%m-%dT%H:%M:%fZ', ?, '+5 minutes'), ?
-    FROM bridge_accounts
-    WHERE true
-    ORDER BY id
-    LIMIT 1
-    ON CONFLICT(nonce_hash) DO NOTHING
-  `).bind(nonceHash, nowIso, nowIso, nowIso).run();
+    INSERT INTO bridge_gateway_nonces (gateway_id, nonce_hash, signed_at, expires_at)
+    VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', ?, '+5 minutes'))
+    ON CONFLICT(gateway_id, nonce_hash) DO NOTHING
+  `).bind(gatewayId, nonceHash, nowIso, nowIso).run();
   if (inserted?.meta?.changes !== 1) return {error: errorResponse('GATEWAY_REPLAY', 409)};
   return {gatewayId};
 }
@@ -236,14 +232,10 @@ async function heartbeat(env, gatewayId, connectors, now) {
       return errorResponse('GATEWAY_INVALID_HEARTBEAT', 400);
     }
     const updated = await env.DB.prepare(`
-      UPDATE bridge_cloud_sessions
-      SET status = ?, last_used_at = ?
-      WHERE account_id = ?
-        AND EXISTS (
-          SELECT 1 FROM bridge_gateway_leases l
-          WHERE l.account_id = bridge_cloud_sessions.account_id
-            AND l.gateway_id = ? AND l.released_at IS NULL AND l.expires_at > ?
-        )
+      UPDATE bridge_gateway_leases
+      SET connector_state = ?, heartbeat_at = ?
+      WHERE account_id = ? AND gateway_id = ?
+        AND released_at IS NULL AND expires_at > ?
     `).bind(connector.state, nowIso, connector.account_id, gatewayId, nowIso).run();
     if (updated?.meta?.changes !== 1) return errorResponse('GATEWAY_INVALID_HEARTBEAT', 400);
     accepted += 1;

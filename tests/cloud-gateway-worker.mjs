@@ -111,13 +111,13 @@ assert(consents.includes('REFERENCES bridge_accounts(id)'), 'cloud consent accou
 assert(consents.includes('FOREIGN KEY (account_id, device_id) REFERENCES bridge_devices(account_id, id)'), 'consent device must belong to its account');
 
 const nonces = assertColumns('bridge_gateway_nonces', [
+  'gateway_id',
   'nonce_hash',
-  'account_id',
   'signed_at',
-  'expires_at',
-  'consumed_at'
+  'expires_at'
 ]);
-assert(nonces.includes('REFERENCES bridge_accounts(id)'), 'gateway nonce account foreign key missing');
+assert(nonces.includes('PRIMARY KEY (gateway_id, nonce_hash)'), 'gateway replay keys must be scoped by gateway');
+assert(!/account_id|REFERENCES\s+bridge_accounts/i.test(nonces), 'gateway nonces must not depend on account lifecycle');
 
 const leases = assertColumns('bridge_gateway_leases', [
   'id',
@@ -126,14 +126,32 @@ const leases = assertColumns('bridge_gateway_leases', [
   'gateway_id',
   'lease_token_hash',
   'lease_seconds',
+  'connector_state',
+  'heartbeat_at',
   'acquired_at',
   'expires_at',
   'released_at'
 ]);
 assert(/lease_seconds\s+INTEGER\s+NOT\s+NULL\s+DEFAULT\s+60/i.test(leases), 'gateway lease must default to 60 seconds');
 assert(/CHECK\s*\(\s*lease_seconds\s*=\s*60\s*\)/i.test(leases), 'gateway lease duration must be fixed at 60 seconds');
+assert(/connector_state\s+TEXT\s+NOT\s+NULL\s+DEFAULT\s+'disabled'/i.test(leases), 'gateway lease connector state must default to disabled');
+for (const state of ['disabled', 'decrypting', 'authenticating', 'compatibility_required', 'revoked']) {
+  assert(leases.includes(`'${state}'`), `gateway lease connector state must enumerate ${state}`);
+}
 assert(leases.includes('REFERENCES bridge_accounts(id)'), 'gateway lease account foreign key missing');
 assert(leases.includes('FOREIGN KEY (account_id, device_id) REFERENCES bridge_devices(account_id, id)'), 'leased device must belong to its account');
+
+assertSqlAccepted(`
+INSERT INTO bridge_accounts (id) VALUES ('account-nonce-only');
+INSERT INTO bridge_gateway_nonces (gateway_id, nonce_hash, signed_at, expires_at)
+VALUES ('gateway-1', 'nonce-hash', '2026-07-12T12:00:00Z', '2026-07-12T12:05:00Z');
+DELETE FROM bridge_accounts WHERE id = 'account-nonce-only';
+`, 'gateway replay records must survive unrelated account deletion');
+assertSqlRejected(`
+INSERT INTO bridge_gateway_leases
+  (id, account_id, device_id, gateway_id, lease_token_hash, connector_state, expires_at)
+VALUES ('lease-invalid-state', 'account-a', 'device-a', 'gateway-1', 'lease-state-hash', 'live', '2026-07-12T12:01:00Z');
+`, 'gateway leases must reject non-enumerated connector states');
 
 const syncState = assertColumns('bridge_sync_state', [
   'account_id',
@@ -200,7 +218,7 @@ assert(media.includes('FOREIGN KEY (account_id, command_id) REFERENCES bridge_de
 
 assertIndex('idx_bridge_cloud_sessions_account_status', 'bridge_cloud_sessions', ['account_id', 'status']);
 assertIndex('idx_bridge_cloud_consents_account_version', 'bridge_cloud_consents', ['account_id', 'warning_version'], {unique: true});
-assertIndex('idx_bridge_gateway_nonces_expiry', 'bridge_gateway_nonces', ['expires_at', 'consumed_at']);
+assertIndex('idx_bridge_gateway_nonces_expiry', 'bridge_gateway_nonces', ['expires_at']);
 assertIndex('idx_bridge_gateway_leases_expiry', 'bridge_gateway_leases', ['expires_at', 'released_at']);
 assertIndex('idx_bridge_sync_state_import', 'bridge_sync_state', ['account_id', 'import_state', 'updated_at']);
 assertIndex('idx_bridge_delivery_queue_claim', 'bridge_delivery_queue', ['state', 'visible_at', 'claim_expires_at', 'expires_at']);

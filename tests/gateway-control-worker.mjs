@@ -6,6 +6,7 @@ import {createGatewayControl} from '../backend/license-worker/src/gateway-contro
 
 const NOW = new Date('2026-07-12T12:00:00.000Z');
 const SECRET = 'gateway-control-secret-value-32-bytes';
+const SECRET_TWO = 'second-gateway-secret-value-32-bytes';
 const encoder = new TextEncoder();
 
 function signature({method = 'POST', path, timestamp, nonce, body, secret = SECRET}) {
@@ -76,8 +77,9 @@ function createGatewayDb() {
           calls.push({sql, params, method: 'run'});
           if (sql.includes('DELETE FROM bridge_gateway_nonces')) return {success: true, meta: {changes: 0}};
           if (sql.includes('INSERT INTO bridge_gateway_nonces')) {
-            if (nonces.has(params[0])) return {success: true, meta: {changes: 0}};
-            nonces.add(params[0]);
+            const replayKey = `${params[0]}:${params[1]}`;
+            if (nonces.has(replayKey)) return {success: true, meta: {changes: 0}};
+            nonces.add(replayKey);
             return {success: true, meta: {changes: 1}};
           }
           if (sql.includes('INSERT INTO bridge_gateway_leases')) {
@@ -87,13 +89,25 @@ function createGatewayDb() {
             if (held || session?.account_status !== 'active' || session?.device_status !== 'active' || !['pending', 'active'].includes(session?.status)) {
               return {success: true, meta: {changes: 0}};
             }
-            leases.push({id, account_id: accountId, device_id: deviceId, gateway_id: gatewayId, lease_token_hash: tokenHash, expires_at: expiresAt, released_at: null});
+            leases.push({
+              id, account_id: accountId, device_id: deviceId, gateway_id: gatewayId,
+              lease_token_hash: tokenHash, connector_state: 'disabled', heartbeat_at: null,
+              expires_at: expiresAt, released_at: null
+            });
             return {success: true, meta: {changes: 1}};
           }
-          if (sql.includes('UPDATE bridge_gateway_leases') && sql.includes('released_at')) {
+          if (sql.includes('UPDATE bridge_gateway_leases') && sql.includes('SET released_at')) {
             const lease = leases.find(item => item.id === params[1]);
             if (lease) lease.released_at = NOW.toISOString();
             return {success: true, meta: {changes: lease ? 1 : 0}};
+          }
+          if (sql.includes('UPDATE bridge_gateway_leases') && sql.includes('connector_state')) {
+            const [state, heartbeatAt, accountId, gatewayId, nowIso] = params;
+            const lease = leases.find(item => item.account_id === accountId && item.gateway_id === gatewayId && !item.released_at && Date.parse(item.expires_at) > Date.parse(nowIso));
+            if (!lease) return {success: true, meta: {changes: 0}};
+            lease.connector_state = state;
+            lease.heartbeat_at = heartbeatAt;
+            return {success: true, meta: {changes: 1}};
           }
           if (sql.includes('UPDATE bridge_cloud_sessions')) {
             const [state, , accountId, gatewayId, nowIso] = params;
@@ -130,7 +144,7 @@ function createGatewayDb() {
 
 const envFor = db => ({
   DB: db,
-  GATEWAY_HMAC_SECRETS: JSON.stringify({'gateway-1': SECRET})
+  GATEWAY_HMAC_SECRETS: JSON.stringify({'gateway-1': SECRET, 'gateway-2': SECRET_TWO})
 });
 const control = createGatewayControl({
   now: () => new Date(NOW),
@@ -176,6 +190,25 @@ for (const offset of [-30, 30]) {
   assert.equal(replay.body.code, 'GATEWAY_REPLAY');
   assert(!JSON.stringify(db.calls).includes('replay-nonce'), 'only a nonce hash may reach D1');
   assert(db.calls.some(item => item.sql.includes("'+5 minutes'")), 'nonce hashes must expire after five minutes');
+  const nonceInsert = db.calls.find(item => item.sql.includes('INSERT INTO bridge_gateway_nonces'));
+  assert(!nonceInsert.sql.includes('bridge_accounts'), 'nonce consumption must not depend on any account row');
+  assert.equal(nonceInsert.params[0], 'gateway-1', 'nonce replay keys must be gateway scoped');
+
+  const independent = await call(signedRequest('/internal/gateway/leases', {gateway_id: 'gateway-2', limit: 20}, {
+    gatewayId: 'gateway-2', secret: SECRET_TWO, nonce: 'replay-nonce'
+  }), db);
+  assert.equal(independent.response.status, 200, 'the same nonce must be independent for another allowed gateway');
+}
+
+{
+  const db = createGatewayDb();
+  db.sessions.length = 0;
+  const leases = await call(signedRequest('/internal/gateway/leases', {gateway_id: 'gateway-1', limit: 20}), db);
+  assert.equal(leases.response.status, 200, 'a signed lease poll with zero accounts must remain valid');
+  assert.deepEqual(leases.body.leases, []);
+  const heartbeat = await call(signedRequest('/internal/gateway/heartbeat', {gateway_id: 'gateway-1', connectors: []}), db);
+  assert.equal(heartbeat.response.status, 200, 'an empty signed heartbeat must remain valid with zero accounts');
+  assert.deepEqual(heartbeat.body, {ok: true, accepted: 0});
 }
 
 for (const request of [
@@ -202,15 +235,24 @@ for (const request of [
 
 {
   const db = createGatewayDb();
-  await call(signedRequest('/internal/gateway/leases', {gateway_id: 'gateway-1', limit: 20}), db);
+  const firstCycle = await call(signedRequest('/internal/gateway/leases', {gateway_id: 'gateway-1', limit: 20}), db);
+  assert.equal(firstCycle.body.leases.length, 1);
   for (const state of ['disabled', 'decrypting', 'authenticating', 'compatibility_required', 'revoked']) {
     const heartbeat = await call(signedRequest('/internal/gateway/heartbeat', {
       gateway_id: 'gateway-1', connectors: [{account_id: 'account-active', state}]
     }), db);
     assert.equal(heartbeat.response.status, 200, `${state} must be an accepted heartbeat state`);
     assert.deepEqual(heartbeat.body, {ok: true, accepted: 1});
-    assert.equal(db.sessions[0].status, state);
+    assert.equal(db.sessions[0].status, 'pending', 'heartbeat must never overwrite cloud-session lifecycle status');
+    assert.equal(db.leases[0].connector_state, state, 'heartbeat state belongs to the active gateway lease');
   }
+
+  const heldCycle = await call(signedRequest('/internal/gateway/leases', {gateway_id: 'gateway-1', limit: 20}), db);
+  assert.equal(heldCycle.body.leases.length, 0, 'the second cycle must respect the current exclusive lease');
+  db.leases[0].expires_at = new Date(NOW.getTime() - 1).toISOString();
+  const secondCycle = await call(signedRequest('/internal/gateway/leases', {gateway_id: 'gateway-1', limit: 20}), db);
+  assert.equal(secondCycle.body.leases.length, 1, 'the next normal cycle must reacquire after lease expiry');
+  assert.equal(db.sessions[0].status, 'pending', 'lease expiry and reacquisition must not alter cloud-session lifecycle');
 
   for (const connectors of [
     [{account_id: 'account-active', state: 'live'}],
