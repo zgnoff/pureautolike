@@ -21,6 +21,12 @@ test('prevents consumers from mutating the published error codes', () => {
   assert.throws(() => toolError('made_up_error'), {name: 'TypeError'});
 });
 
+test('does not expose mutable error codes through valueOf', () => {
+  assert.throws(() => ERROR_CODES.valueOf().add('made_up_error'), {name: 'TypeError'});
+  assert.equal(ERROR_CODES.valueOf(), ERROR_CODES);
+  assert.throws(() => toolError('made_up_error'), {name: 'TypeError'});
+});
+
 test('creates frozen success results with stable metadata', () => {
   const result = success({state: 'active'}, {
     executor: 'gateway', requestId: 'req-1', capabilityVersion: '1'

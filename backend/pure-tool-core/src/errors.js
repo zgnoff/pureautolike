@@ -17,24 +17,40 @@ const CODES = [
 ];
 
 const VALID_ERROR_CODES = new Set(CODES);
-const PUBLISHED_ERROR_CODES = new Set(CODES);
 
 function rejectMutation() {
   throw new TypeError('ERROR_CODES is read-only');
 }
 
-export const ERROR_CODES = new Proxy(PUBLISHED_ERROR_CODES, {
-  get(target, property) {
-    if (property === 'add' || property === 'delete' || property === 'clear') {
-      return rejectMutation;
-    }
-    if (property === 'forEach') {
-      return (callback, thisArg) => target.forEach((value) => {
-        callback.call(thisArg, value, value, ERROR_CODES);
-      });
-    }
-    const value = Reflect.get(target, property, target);
-    return typeof value === 'function' ? value.bind(target) : value;
+export const ERROR_CODES = Object.freeze({
+  get size() {
+    return VALID_ERROR_CODES.size;
+  },
+  has(code) {
+    return VALID_ERROR_CODES.has(code);
+  },
+  keys() {
+    return VALID_ERROR_CODES.keys();
+  },
+  values() {
+    return VALID_ERROR_CODES.values();
+  },
+  entries() {
+    return VALID_ERROR_CODES.entries();
+  },
+  forEach(callback, thisArg) {
+    VALID_ERROR_CODES.forEach((value) => {
+      callback.call(thisArg, value, value, ERROR_CODES);
+    });
+  },
+  [Symbol.iterator]() {
+    return VALID_ERROR_CODES[Symbol.iterator]();
+  },
+  add: rejectMutation,
+  delete: rejectMutation,
+  clear: rejectMutation,
+  valueOf() {
+    return ERROR_CODES;
   }
 });
 
