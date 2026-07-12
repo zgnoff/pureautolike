@@ -61,13 +61,20 @@ CLOUD_TEST_ACCOUNT_IDS = ""
 CLOUD_WARNING_VERSION = "<WARNING_VERSION>"
 ```
 
-Generate an independent random HMAC secret using the host secret manager. Store
-a JSON gateway-id-to-secret map as a Cloudflare secret, never a plaintext
-Wrangler variable:
+Generate an independent random HMAC secret using the host secret manager. Have
+the secret manager or authorized operator prepare
+`<GATEWAY_HMAC_JSON_FILE>` outside this runbook with the complete
+gateway-id-to-secret JSON mapping. Do not type, print, echo, or pass its contents
+as command arguments. Verify the file and send it to Wrangler only through
+stdin:
 
 ```bash
 cd backend/license-worker
-printf '%s' '{"<GATEWAY_ID>":"<HMAC_SECRET>"}' | npx wrangler secret put GATEWAY_HMAC_SECRETS
+GATEWAY_HMAC_JSON_FILE="<GATEWAY_HMAC_JSON_FILE>"
+test -f "$GATEWAY_HMAC_JSON_FILE"
+chmod 600 "$GATEWAY_HMAC_JSON_FILE"
+test "$(stat -c '%a' "$GATEWAY_HMAC_JSON_FILE")" = "600"
+npx wrangler secret put GATEWAY_HMAC_SECRETS < "$GATEWAY_HMAC_JSON_FILE"
 ```
 
 Do not use the Pure session credential or the gateway private key as the HMAC
@@ -206,8 +213,10 @@ the matching private JWK) with placeholders only:
 
 ```bash
 cd backend/license-worker
+ROLLBACK_GATEWAY_PUBLIC_JWK_FILE="<ROLLBACK_GATEWAY_PUBLIC_JWK_FILE>"
+test -f "$ROLLBACK_GATEWAY_PUBLIC_JWK_FILE"
 npx wrangler deploy src/worker.js \
-  --var "GATEWAY_PUBLIC_JWK:<ROLLBACK_ONE_LINE_PUBLIC_JWK>" \
+  --var "GATEWAY_PUBLIC_JWK:$(tr -d '\n' < "$ROLLBACK_GATEWAY_PUBLIC_JWK_FILE")" \
   --var "GATEWAY_KEY_ID:<ROLLBACK_GATEWAY_KEY_ID>" \
   --var "CLOUD_TEST_ENABLED:false"
 systemctl stop pureautolike-gateway
@@ -247,19 +256,28 @@ private-key overwrite:
 2. Have the secret manager render `<NEW_GATEWAY_ENV_FILE>` with the new
    `GATEWAY_PRIVATE_JWK`, `<NEW_GATEWAY_ID>`, `<NEW_HMAC_SECRET>`, and matching
    `GATEWAY_KEY_ID`. Do not print that file.
-3. Overlap the old and new HMAC identities in the Worker secret:
+3. Have the secret manager or authorized operator prepare
+   `<OVERLAP_GATEWAY_HMAC_JSON_FILE>` outside this runbook with both authorized
+   identities. Never print or pass its JSON in command arguments. Verify its
+   permissions and replace the Worker secret through stdin:
 
    ```bash
    cd backend/license-worker
-   printf '%s' '{"<OLD_GATEWAY_ID>":"<OLD_HMAC_SECRET>","<NEW_GATEWAY_ID>":"<NEW_HMAC_SECRET>"}' | npx wrangler secret put GATEWAY_HMAC_SECRETS
+   OVERLAP_GATEWAY_HMAC_JSON_FILE="<OVERLAP_GATEWAY_HMAC_JSON_FILE>"
+   test -f "$OVERLAP_GATEWAY_HMAC_JSON_FILE"
+   chmod 600 "$OVERLAP_GATEWAY_HMAC_JSON_FILE"
+   test "$(stat -c '%a' "$OVERLAP_GATEWAY_HMAC_JSON_FILE")" = "600"
+   npx wrangler secret put GATEWAY_HMAC_SECRETS < "$OVERLAP_GATEWAY_HMAC_JSON_FILE"
    ```
 
 4. Deploy the new Worker public pin and key id while preserving only the
    separately authorized cloud-test state:
 
    ```bash
+   NEW_GATEWAY_PUBLIC_JWK_FILE="<NEW_GATEWAY_PUBLIC_JWK_FILE>"
+   test -f "$NEW_GATEWAY_PUBLIC_JWK_FILE"
    npx wrangler deploy src/worker.js \
-     --var "GATEWAY_PUBLIC_JWK:<NEW_ONE_LINE_PUBLIC_JWK>" \
+     --var "GATEWAY_PUBLIC_JWK:$(tr -d '\n' < "$NEW_GATEWAY_PUBLIC_JWK_FILE")" \
      --var "GATEWAY_KEY_ID:<NEW_GATEWAY_KEY_ID>" \
      --var "CLOUD_TEST_ENABLED:<AUTHORIZED_CLOUD_TEST_ENABLED>"
    ```
@@ -279,11 +297,18 @@ private-key overwrite:
    pinned to the new key. Old-key envelopes must fail with
    `GATEWAY_KEY_MISMATCH`. Verify every retained cloud session reports the new
    key id before securely deleting the retired private JWK.
-7. After signed lease/heartbeat health is verified on `<NEW_GATEWAY_ID>`, remove
-   the retired HMAC mapping:
+7. After signed lease/heartbeat health is verified on `<NEW_GATEWAY_ID>`, have
+   the secret manager or authorized operator prepare
+   `<RETIRED_GATEWAY_HMAC_JSON_FILE>` outside this runbook with only the retained
+   authorized identities. Verify permissions and remove the retired mapping by
+   replacing the Worker secret through stdin:
 
    ```bash
-   printf '%s' '{"<NEW_GATEWAY_ID>":"<NEW_HMAC_SECRET>"}' | npx wrangler secret put GATEWAY_HMAC_SECRETS
+   RETIRED_GATEWAY_HMAC_JSON_FILE="<RETIRED_GATEWAY_HMAC_JSON_FILE>"
+   test -f "$RETIRED_GATEWAY_HMAC_JSON_FILE"
+   chmod 600 "$RETIRED_GATEWAY_HMAC_JSON_FILE"
+   test "$(stat -c '%a' "$RETIRED_GATEWAY_HMAC_JSON_FILE")" = "600"
+   npx wrangler secret put GATEWAY_HMAC_SECRETS < "$RETIRED_GATEWAY_HMAC_JSON_FILE"
    ```
 
 Never reuse either HMAC secret as an encryption key.

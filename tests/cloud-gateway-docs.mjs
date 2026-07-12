@@ -25,7 +25,34 @@ assert.match(gatewayRunbook, /CLOUD_TEST_ENABLED = "false"/, 'runbook must keep 
 assert.match(gatewayRunbook, /fixed 24-hour expiry/, 'runbook must document the future queue expiry');
 assert.match(gatewayRunbook, /GATEWAY_PUBLIC_JWK[\s\S]*public pin may be distributed/, 'runbook must identify the distributable public pin');
 assert.match(gatewayRunbook, /GATEWAY_PRIVATE_JWK[\s\S]*private JWK must never leave secret storage/, 'runbook must separate private key secret storage');
-assert.match(gatewayRunbook, /npx wrangler secret put GATEWAY_HMAC_SECRETS/, 'runbook must provision the Worker HMAC secret');
+function assertSafeHmacSecretCommands(source, expectedCount = 3) {
+  const lines = source
+    .split('\n')
+    .map(line => line.trim())
+    .filter(line => line.includes('wrangler secret put GATEWAY_HMAC_SECRETS'));
+  assert.equal(lines.length, expectedCount, 'runbook must contain the expected HMAC secret updates');
+  for (const line of lines) {
+    assert.match(
+      line,
+      /^npx wrangler secret put GATEWAY_HMAC_SECRETS < "\$[A-Z_]*GATEWAY_HMAC_JSON_FILE"$/,
+      'every HMAC secret update must use quoted file redirection only'
+    );
+    const index = source.indexOf(line);
+    const context = source.slice(Math.max(0, index - 600), index + line.length + 200);
+    assert.doesNotMatch(context, /['"]?\{[^{}\n]*:[^{}\n]*\}['"]?/, 'HMAC secret context must not contain any literal JSON mapping');
+  }
+  assert.doesNotMatch(source, /(?:printf|echo)[^\n]*GATEWAY_HMAC_SECRETS/i, 'runbook must not pass HMAC mappings through printf or echo');
+  assert.doesNotMatch(source, /(?:-d|--data|--arg)\s+[^\n]*GATEWAY_HMAC_SECRETS/i, 'runbook must not place HMAC mappings in command arguments');
+  assert.doesNotMatch(source, /[A-Z_]*GATEWAY_HMAC(?:_JSON)?(?:_FILE)?\s*=\s*['"]?\{/, 'runbook must not assign inline HMAC JSON');
+}
+assertSafeHmacSecretCommands(gatewayRunbook);
+for (const unsafe of [
+  `printf '%s' '{"gateway-1":"literal-value"}' | npx wrangler secret put GATEWAY_HMAC_SECRETS`,
+  `echo '{"gateway-1":"literal-value"}' | npx wrangler secret put GATEWAY_HMAC_SECRETS`,
+  `npx wrangler secret put GATEWAY_HMAC_SECRETS -d '{"gateway-1":"literal-value"}'`,
+  `GATEWAY_HMAC_JSON='{"gateway-1":"literal-value"}'\nnpx wrangler secret put GATEWAY_HMAC_SECRETS < "$GATEWAY_HMAC_JSON_FILE"`,
+  `npx wrangler secret put GATEWAY_HMAC_SECRETS <<< '{"gateway-1":"literal-value"}'`
+]) assert.throws(() => assertSafeHmacSecretCommands(unsafe, 1), 'HMAC scanner must reject every inline JSON transport shape');
 assert.match(gatewayRunbook, /known deployed database predates every cloud table/, 'runbook must identify the known pre-cloud D1 shape');
 assert.match(gatewayRunbook, /Only an intermediate installation needs a migration/, 'runbook must condition migration on an intermediate cloud schema');
 assert.match(gatewayRunbook, /npx wrangler d1 execute pureautolike_license --remote --file schema\.sql/, 'runbook must apply the complete schema to the known pre-cloud database');
@@ -37,9 +64,29 @@ assert.match(gatewayRunbook, /systemctl is-active pureautolike-gateway/, 'runboo
 assert.match(gatewayRunbook, /systemctl stop pureautolike-gateway/, 'runbook must include the kill switch');
 assert.match(gatewayRunbook, /ln -sfn \/opt\/pureautolike\/releases\/<PREVIOUS_RELEASE>\/backend\/pure-gateway \/opt\/pureautolike\/backend\/pure-gateway\.next/, 'rollback must restore the previous release symlink');
 assert.match(gatewayRunbook, /install -o root -g pureautolike-gateway -m 0600 <ROLLBACK_GATEWAY_ENV_FILE> \/etc\/pureautolike\/gateway\.env/, 'rollback must replace the environment and private JWK');
-assert.match(gatewayRunbook, /--var "GATEWAY_PUBLIC_JWK:<NEW_ONE_LINE_PUBLIC_JWK>"/, 'rotation must deploy the new Worker public pin');
-assert.match(gatewayRunbook, /printf '%s' '\{"<OLD_GATEWAY_ID>":"<OLD_HMAC_SECRET>","<NEW_GATEWAY_ID>":"<NEW_HMAC_SECRET>"\}' \| npx wrangler secret put GATEWAY_HMAC_SECRETS/, 'rotation must overlap old and new HMAC identities');
-assert.match(gatewayRunbook, /printf '%s' '\{"<NEW_GATEWAY_ID>":"<NEW_HMAC_SECRET>"\}' \| npx wrangler secret put GATEWAY_HMAC_SECRETS/, 'rotation must remove the retired HMAC identity');
+for (const fileVariable of [
+  'GATEWAY_HMAC_JSON_FILE',
+  'OVERLAP_GATEWAY_HMAC_JSON_FILE',
+  'RETIRED_GATEWAY_HMAC_JSON_FILE'
+]) {
+  assert.ok(gatewayRunbook.includes(`chmod 600 "$${fileVariable}"`), `runbook must chmod ${fileVariable} to 600`);
+  assert.ok(gatewayRunbook.includes(`test "$(stat -c '%a' "$${fileVariable}")" = "600"`), `runbook must verify ${fileVariable} mode 600`);
+}
+const publicJwkVarLines = gatewayRunbook
+  .split('\n')
+  .map(line => line.trim())
+  .filter(line => line.startsWith('--var "GATEWAY_PUBLIC_JWK:'));
+assert.equal(publicJwkVarLines.length, 2, 'rollback and rotation must each deploy a public JWK from a file');
+for (const line of publicJwkVarLines) {
+  assert.match(
+    line,
+    /^--var "GATEWAY_PUBLIC_JWK:\$\(tr -d '\\n' < "\$[A-Z_]*GATEWAY_PUBLIC_JWK_FILE"\)" \\$/,
+    'public JWK vars must use quoted substitution from a named file'
+  );
+}
+for (const fileVariable of ['ROLLBACK_GATEWAY_PUBLIC_JWK_FILE', 'NEW_GATEWAY_PUBLIC_JWK_FILE']) {
+  assert.ok(gatewayRunbook.includes(`test -f "$${fileVariable}"`), `runbook must verify ${fileVariable} exists`);
+}
 assert.match(gatewayRunbook, /test "<PROTOCOL_FIXTURE_GATE>" = "open"[\s\S]*test "<AUTHORIZED_CONTROLLED_DEPLOYMENT>" = "yes"/, 'rotation restart must have protocol-gate and deployment-authorization guards');
 assert.match(gatewayRunbook, /Before that point, do not restart the gateway/, 'rotation must forbid restart before the protocol gate opens');
 
@@ -64,8 +111,8 @@ assert.doesNotMatch(gatewayRunbook, /"d"\s*:\s*"[A-Za-z0-9_-]{20,}"/, 'runbook m
 assert.doesNotMatch(gatewayRunbook, /\b\d{8,10}:[A-Za-z0-9_-]{30,}\b/, 'runbook must not contain a Telegram bot token');
 assert.doesNotMatch(gatewayRunbook, /(?:CLOUDFLARE_API_TOKEN|CF_API_TOKEN|API_TOKEN|TELEGRAM_BOT_TOKEN)\s*=\s*(?!<)[^\s<]+/i, 'runbook must not contain a live-looking API token assignment');
 assert.doesNotMatch(gatewayRunbook, /GATEWAY_PRIVATE_JWK=(?!<)[^\n]+/, 'runbook must use a placeholder for the private JWK');
-for (const match of gatewayRunbook.matchAll(/"<[^"\n]*GATEWAY_ID>"\s*:\s*"([^"\n]+)"/g)) {
-  assert.match(match[1], /^<[^>]*HMAC_SECRET>$/, 'runbook HMAC JSON values must be placeholders');
-}
+assert.doesNotMatch(gatewayRunbook, /['"]\{[^}\n]*(?:GATEWAY_ID|HMAC_SECRET)[^}\n]*\}['"]/, 'runbook must not contain literal HMAC JSON mappings');
+assert.doesNotMatch(gatewayRunbook, /--var "GATEWAY_PUBLIC_JWK:<[^>]+>"/, 'runbook must not place an inline public JWK placeholder in argv');
+assert.doesNotMatch(gatewayRunbook, /--var "GATEWAY_PUBLIC_JWK:\{/, 'runbook must not place inline public JWK JSON in argv');
 
 console.log('cloud gateway documentation contract passed');
