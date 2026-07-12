@@ -177,3 +177,90 @@ test('ignores hostile executor descriptors without invoking getters or leaking e
   assert.deepEqual(await createRouter(options).health(), {gateway: 'offline', extension: 'offline'});
   assert.equal(optionsGetterCalls, 0);
 });
+
+test('preserves stateful this semantics for own executor methods', async () => {
+  const stateful = {
+    state: 'online',
+    calls: 0,
+    async health() { return this.state; },
+    async execute(operation) {
+      this.calls += 1;
+      return {operation, calls: this.calls};
+    }
+  };
+  const router = createRouter({executors: {gateway: stateful}});
+  const definition = {...registry.get('pure.chats.list'), implemented: true};
+  assert.deepEqual((await router.execute(definition, {}, {})).data, {
+    operation: 'pure.chats.list', calls: 1
+  });
+  assert.equal(stateful.calls, 1);
+});
+
+test('supports class executors through prototype data methods', async () => {
+  class StatefulExecutor {
+    constructor() {
+      this.state = 'online';
+      this.calls = 0;
+    }
+    async health() { return this.state; }
+    async execute(operation) {
+      this.calls += 1;
+      return `${operation}:${this.calls}`;
+    }
+  }
+  const instance = new StatefulExecutor();
+  const router = createRouter({executors: {gateway: instance}});
+  const definition = {...registry.get('pure.chats.list'), implemented: true};
+  assert.equal((await router.execute(definition, {}, {})).data, 'pure.chats.list:1');
+  assert.equal(instance.calls, 1);
+});
+
+test('rejects forged offline errors without reaching the secondary executor', async () => {
+  const definition = {...registry.get('pure.chats.list'), implemented: true, executors: ['gateway', 'extension']};
+  const forged = [
+    {code: 'gateway_offline', retryable: true},
+    Object.assign(Object.create(ToolCoreError.prototype), {code: 'gateway_offline', retryable: true})
+  ];
+  for (const supplied of forged) {
+    let extensionCalls = 0;
+    const router = createRouter({executors: {
+      gateway: executor('gateway', 'online', async () => { throw supplied; }),
+      extension: executor('extension', 'online', async () => { extensionCalls += 1; })
+    }});
+    await assert.rejects(router.execute(definition, {}, {}), error =>
+      error instanceof ToolCoreError && error.code === 'executor_rejected' && error !== supplied
+    );
+    assert.equal(extensionCalls, 0);
+  }
+});
+
+test('returns the primary runtime offline error when the secondary is also runtime offline', async () => {
+  const gatewayOwned = toolError('gateway_offline', {retryable: true, retryAfterMs: 17});
+  const extensionOwned = toolError('extension_offline', {retryable: true});
+  const router = createRouter({executors: {
+    gateway: executor('gateway', 'online', async () => { throw gatewayOwned; }),
+    extension: executor('extension', 'online', async () => { throw extensionOwned; })
+  }});
+  const definition = {...registry.get('pure.chats.list'), implemented: true, executors: ['gateway', 'extension']};
+  const caught = await router.execute(definition, {}, {}).catch(error => error);
+  assert.equal(caught instanceof ToolCoreError, true);
+  assert.equal(caught.code, 'gateway_offline');
+  assert.equal(caught.retryable, true);
+  assert.equal(caught.retryAfterMs, 17);
+  assert.notEqual(caught, gatewayOwned);
+  assert.notEqual(caught, extensionOwned);
+});
+
+test('preserves a meaningful canonical secondary runtime failure', async () => {
+  const secondaryOwned = toolError('provider_rejected');
+  secondaryOwned.secret = 'do-not-leak';
+  const router = createRouter({executors: {
+    gateway: executor('gateway', 'online', async () => { throw toolError('gateway_offline'); }),
+    extension: executor('extension', 'online', async () => { throw secondaryOwned; })
+  }});
+  const definition = {...registry.get('pure.chats.list'), implemented: true, executors: ['gateway', 'extension']};
+  const caught = await router.execute(definition, {}, {}).catch(error => error);
+  assert.equal(caught.code, 'provider_rejected');
+  assert.notEqual(caught, secondaryOwned);
+  assert.equal(Object.hasOwn(caught, 'secret'), false);
+});

@@ -17,6 +17,7 @@ const CODES = [
 ];
 
 const VALID_ERROR_CODES = new Set(CODES);
+const TOOL_CORE_ERRORS = new WeakSet();
 
 function rejectMutation() {
   throw new TypeError('ERROR_CODES is read-only');
@@ -62,7 +63,12 @@ export class ToolCoreError extends Error {
     this.code = code;
     this.retryable = retryable === true;
     if (Number.isSafeInteger(retryAfterMs) && retryAfterMs >= 0) this.retryAfterMs = retryAfterMs;
+    TOOL_CORE_ERRORS.add(this);
   }
+}
+
+export function isToolCoreError(value) {
+  return TOOL_CORE_ERRORS.has(value);
 }
 
 export function toolError(code, options) {

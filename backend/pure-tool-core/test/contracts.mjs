@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import * as publicCore from '../src/index.js';
 import {ERROR_CODES, ToolCoreError, failure, success, toolError} from '../src/index.js';
+import {isToolCoreError} from '../src/errors.js';
 
 test('publishes the stable foundation error codes', () => {
   assert(ERROR_CODES.has('invalid_input'));
@@ -64,4 +66,18 @@ test('does not retain provider errors on public error properties', () => {
 
 test('rejects unknown error codes', () => {
   assert.throws(() => toolError('made_up_error'), {name: 'TypeError'});
+});
+
+test('brands only errors constructed by the core error contract', () => {
+  const direct = new ToolCoreError('gateway_offline');
+  const factory = toolError('extension_offline');
+  const forged = Object.assign(Object.create(ToolCoreError.prototype), {
+    code: 'gateway_offline', retryable: true
+  });
+  assert.equal(isToolCoreError(direct), true);
+  assert.equal(isToolCoreError(factory), true);
+  assert.equal(isToolCoreError(new Proxy(factory, {})), false);
+  assert.equal(isToolCoreError(forged), false);
+  assert.equal(isToolCoreError({code: 'gateway_offline', retryable: true}), false);
+  assert.equal(Object.hasOwn(publicCore, 'isToolCoreError'), false);
 });
