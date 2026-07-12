@@ -1,11 +1,18 @@
-const EMPTY_INPUT = Object.freeze({type: 'object', properties: {}, additionalProperties: false});
+function deepFreeze(value, seen = new WeakSet()) {
+  if (value === null || typeof value !== 'object' || seen.has(value)) return value;
+  seen.add(value);
+  for (const child of Object.values(value)) deepFreeze(child, seen);
+  return Object.freeze(value);
+}
 
-const idInput = key => Object.freeze({
+const EMPTY_INPUT = deepFreeze({type: 'object', properties: {}, additionalProperties: false});
+
+const idInput = key => deepFreeze({
   type: 'object', additionalProperties: false, required: [key],
   properties: {[key]: {type: 'string', minLength: 1, maxLength: 128}}
 });
 
-const pageInput = Object.freeze({
+const pageInput = deepFreeze({
   type: 'object', additionalProperties: false,
   properties: {
     cursor: {type: 'string', minLength: 1, maxLength: 512},
@@ -14,7 +21,7 @@ const pageInput = Object.freeze({
 });
 
 function define(name, options = {}) {
-  return Object.freeze({
+  return deepFreeze({
     name,
     schemaVersion: '1',
     description: options.description || name,
