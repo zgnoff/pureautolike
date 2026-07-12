@@ -1,4 +1,5 @@
 export {CORE_TOOL_DEFINITIONS} from './catalog.js';
+export {createToolCore} from './core.js';
 export {ERROR_CODES, ToolCoreError, toolError} from './errors.js';
 export {authorize, confirmationBinding} from './policy.js';
 export {createRegistry} from './registry.js';
