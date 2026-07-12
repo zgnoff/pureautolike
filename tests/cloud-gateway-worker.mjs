@@ -543,6 +543,25 @@ assert(streamedOversizeResponse.status === 413, 'chunked cloud body over 64 KiB 
 assert(streamedBodyCanceled, 'oversized chunked body reader must be canceled immediately');
 assert(streamedBodyPulls <= 3, 'oversized chunked body must stop reading after crossing the limit');
 
+const cancelRejectingStream = new ReadableStream({
+  pull(controller) {
+    controller.enqueue(new Uint8Array(40000));
+  },
+  cancel() {
+    throw new Error('seeded cancel rejection');
+  }
+});
+const cancelRejectingOversizeResponse = await cloudBridge.handle(new Request('https://worker.example/v1/cloud/session', {
+  method: 'PUT',
+  headers: {
+    Authorization: `Bearer ${cloudToken}`,
+    'Content-Type': 'application/json'
+  },
+  body: cancelRejectingStream,
+  duplex: 'half'
+}), cloudEnv());
+assert(cancelRejectingOversizeResponse.status === 413, 'reader cancellation rejection must not replace a proven oversize 413');
+
 for (const createdAt of [cloudNow.getTime() - 30001, cloudNow.getTime() + 30001]) {
   const response = await callCloud('/v1/cloud/session', {
     method: 'PUT',

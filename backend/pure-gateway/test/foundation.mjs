@@ -14,7 +14,7 @@ import {ConnectorManager} from '../src/connector-manager.js';
 import {runGateway} from '../src/main.js';
 
 const encoder = new TextEncoder();
-const SEEDED_BEARER = 'Bearer gateway-foundation-seeded-token';
+const SEEDED_BEARER = 'fixture-auth-value-gateway-foundation';
 const SEEDED_AGENT = 'gateway-foundation-seeded-agent';
 const KEY_ID = 'gateway-key-2026-07';
 const ACCOUNT_ID = 'account-fixture-42';
