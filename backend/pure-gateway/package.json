@@ -1,0 +1,13 @@
+{
+  "name": "pureautolike-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test test/*.mjs",
+    "check": "node --check src/config.js && node --check src/crypto.js && node --check src/control-client.js && node --check src/connector-manager.js && node --check src/main.js"
+  }
+}

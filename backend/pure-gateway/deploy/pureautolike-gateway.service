@@ -1,0 +1,41 @@
+[Unit]
+Description=PureAutoLike encrypted cloud gateway
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+RequiresMountsFor=/var/lib/pureautolike-gateway/spool
+
+[Service]
+Type=simple
+User=pureautolike-gateway
+Group=pureautolike-gateway
+WorkingDirectory=/opt/pureautolike/backend/pure-gateway
+EnvironmentFile=/etc/pureautolike/gateway.env
+ExecStart=/usr/bin/node src/main.js
+Restart=on-failure
+RestartSec=5s
+MemoryMax=1G
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Provision this single writable path on an encrypted filesystem before startup.
+ReadWritePaths=/var/lib/pureautolike-gateway/spool
+
+[Install]
+WantedBy=multi-user.target
