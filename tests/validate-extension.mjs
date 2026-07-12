@@ -292,6 +292,7 @@ const refreshStatsSlice = popupScript.slice(popupScript.indexOf('async function 
 assert(!refreshStatsSlice.includes('storedProfiles('), 'popup refreshStats must not load all profile captures every second');
 assert(refreshStatsSlice.includes('profileStorageSummary()'), 'popup refreshStats must read the lightweight profile index');
 
+await import('./cloud-gateway-docs.mjs');
 const worker = await read('backend/license-worker/src/worker.js');
 const workerCheck = spawnSync(process.execPath, ['--check', 'backend/license-worker/src/worker.js'], {
   cwd: root,

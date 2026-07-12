@@ -47,6 +47,24 @@ If paid access is enabled later, subscription checks may also use an email
 address or payment customer id that the user provides through the payment flow.
 PureAutoLike does not process payment card numbers directly.
 
+The separately consented cloud gateway test processes an encrypted Pure credential envelope.
+The browser encrypts the active session credential to the
+gateway's pinned public key; the gateway holds the corresponding private key
+and decrypts the envelope only in gateway memory to operate the user's Pure
+session. PureAutoLike does not ask for or receive the user’s Pure password.
+This is server-side encrypted transport, not end-to-end encryption, because the
+gateway must use the session credential after decryption.
+
+Cloud test traffic leaves from a shared server IP. Pure may associate that
+shared server IP with multiple test accounts, restrict those accounts, or block
+them. During the controlled test, access is limited to owner-operated test accounts
+that explicitly accept this risk; it is not enabled for general users.
+
+The current gateway foundation does not enable Telegram-to-Pure sending. If a
+future encrypted Telegram-to-Pure command queue is activated, queued commands
+have a fixed 24-hour expiry and are deleted after expiry or destructive cloud
+disconnect. Queue payloads remain encrypted outside the active gateway process.
+
 ## Data Sent To Third Parties
 
 PureAutoLike sends data to third parties only for core extension features:

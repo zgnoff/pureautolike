@@ -18,8 +18,7 @@ tokens into source control, shell history, tickets, or logs.
 - This is not end-to-end encryption: the gateway must use the decrypted session
   credential to communicate with Pure.
 - All controlled-test accounts share the gateway's server IP. Pure may restrict
-  or block them. Allowlist only owner-operated test accounts that accepted the
-  current warning.
+  or block them. Allowlist only owner-operated test accounts that accepted the current warning.
 - The future Telegram-to-Pure delivery queue has a fixed 24-hour expiry. Sending
   remains disabled during this foundation test.
 - `CLOUD_TEST_ENABLED = "false"` is the default and the rollback position.
@@ -46,8 +45,8 @@ chmod 600 <SECURE_WORKDIR>/gateway-private.jwk
 
 Pin the one-line public file as Worker `GATEWAY_PUBLIC_JWK` and assign a unique
 `GATEWAY_KEY_ID`, for example `<GATEWAY_KEY_ID>`. Put only the matching one-line
-private file in the VPS environment as `GATEWAY_PRIVATE_JWK`. The public pin may
-be distributed; the private JWK must never leave secret storage.
+private file in the VPS environment as `GATEWAY_PRIVATE_JWK`. The public pin may be distributed;
+the private JWK must never leave secret storage.
 
 ## 2. Provision Worker configuration and secrets
 
@@ -144,6 +143,12 @@ systemd-analyze verify /etc/systemd/system/pureautolike-gateway.service
 systemctl daemon-reload
 ```
 
+The hardened unit keeps exactly one writable service path:
+
+```ini
+ReadWritePaths=/var/lib/pureautolike-gateway/spool
+```
+
 Do not start or enable the unit during preparation.
 
 ## 5. Pre-enable health checks
@@ -193,29 +198,95 @@ systemctl stop pureautolike-gateway
 systemctl is-inactive pureautolike-gateway
 ```
 
-Rollback keeps the kill switch false, stops the service, restores
-`<PREVIOUS_REVIEWED_RELEASE>`, re-runs the pre-enable checks, and only then allows
-a separately authorized restart. Never roll back the D1 schema destructively;
-restore `<ENCRYPTED_BACKUP_PATH>` only under a reviewed incident plan.
+Rollback keeps the kill switch false. The release layout must use
+`/opt/pureautolike/backend/pure-gateway` as a symlink to an immutable directory
+under `/opt/pureautolike/releases`. Restore the previous Worker public pin,
+gateway artifact, and complete permission-restricted environment file (including
+the matching private JWK) with placeholders only:
+
+```bash
+cd backend/license-worker
+npx wrangler deploy src/worker.js \
+  --var "GATEWAY_PUBLIC_JWK:<ROLLBACK_ONE_LINE_PUBLIC_JWK>" \
+  --var "GATEWAY_KEY_ID:<ROLLBACK_GATEWAY_KEY_ID>" \
+  --var "CLOUD_TEST_ENABLED:false"
+systemctl stop pureautolike-gateway
+test -d /opt/pureautolike/releases/<PREVIOUS_RELEASE>/backend/pure-gateway
+ln -sfn /opt/pureautolike/releases/<PREVIOUS_RELEASE>/backend/pure-gateway /opt/pureautolike/backend/pure-gateway.next
+mv -Tf /opt/pureautolike/backend/pure-gateway.next /opt/pureautolike/backend/pure-gateway
+install -o root -g pureautolike-gateway -m 0600 <ROLLBACK_GATEWAY_ENV_FILE> /etc/pureautolike/gateway.env
+systemctl daemon-reload
+systemctl restart pureautolike-gateway
+systemctl status pureautolike-gateway --no-pager
+journalctl -u pureautolike-gateway --since '-10 minutes' --no-pager
+```
+
+`<ROLLBACK_GATEWAY_ENV_FILE>` must be rendered by the secret manager and contain
+the rollback `GATEWAY_PRIVATE_JWK`; do not construct it in shell history. Re-run
+the pre-enable checks after restoration. Never roll back the D1 schema
+destructively; restore `<ENCRYPTED_BACKUP_PATH>` only under a reviewed incident
+plan.
 
 ## 7. Key rotation
 
-Key rotation is a staged re-encryption, not an in-place private-key overwrite:
+This rotation procedure applies only after the protocol fixture gate opens and
+an authorized controlled deployment already exists. Before that point, do not restart the gateway
+and do not run any Worker, secret, environment, or systemd mutation below. The
+literal placeholder guards intentionally fail until an authorized operator
+replaces them with externally verified gate values:
 
-1. Generate a new P-256 pair and a new `<GATEWAY_KEY_ID>` using section 1.
-2. While `CLOUD_TEST_ENABLED = "false"`, update the Worker public pin and key id.
-3. Install the matching new `GATEWAY_PRIVATE_JWK` and `GATEWAY_KEY_ID` in the
-   permission-restricted environment file, then restart the stopped gateway.
-4. Require every owner test device to reauthenticate and upload a fresh envelope
+```bash
+test "<PROTOCOL_FIXTURE_GATE>" = "open"
+test "<AUTHORIZED_CONTROLLED_DEPLOYMENT>" = "yes"
+```
+
+After both guards succeed, rotation is a staged re-encryption, not an in-place
+private-key overwrite:
+
+1. Generate a new P-256 pair and a new `<NEW_GATEWAY_KEY_ID>` using section 1.
+2. Have the secret manager render `<NEW_GATEWAY_ENV_FILE>` with the new
+   `GATEWAY_PRIVATE_JWK`, `<NEW_GATEWAY_ID>`, `<NEW_HMAC_SECRET>`, and matching
+   `GATEWAY_KEY_ID`. Do not print that file.
+3. Overlap the old and new HMAC identities in the Worker secret:
+
+   ```bash
+   cd backend/license-worker
+   printf '%s' '{"<OLD_GATEWAY_ID>":"<OLD_HMAC_SECRET>","<NEW_GATEWAY_ID>":"<NEW_HMAC_SECRET>"}' | npx wrangler secret put GATEWAY_HMAC_SECRETS
+   ```
+
+4. Deploy the new Worker public pin and key id while preserving only the
+   separately authorized cloud-test state:
+
+   ```bash
+   npx wrangler deploy src/worker.js \
+     --var "GATEWAY_PUBLIC_JWK:<NEW_ONE_LINE_PUBLIC_JWK>" \
+     --var "GATEWAY_KEY_ID:<NEW_GATEWAY_KEY_ID>" \
+     --var "CLOUD_TEST_ENABLED:<AUTHORIZED_CLOUD_TEST_ENABLED>"
+   ```
+
+5. Replace the complete environment/private-JWK file and verify the restarted
+   service with redacted status and logs:
+
+   ```bash
+   install -o root -g pureautolike-gateway -m 0600 <NEW_GATEWAY_ENV_FILE> /etc/pureautolike/gateway.env
+   systemctl daemon-reload
+   systemctl restart pureautolike-gateway
+   systemctl status pureautolike-gateway --no-pager
+   journalctl -u pureautolike-gateway --since '-10 minutes' --no-pager
+   ```
+
+6. Require every owner test device to reauthenticate and upload a fresh envelope
    pinned to the new key. Old-key envelopes must fail with
-   `GATEWAY_KEY_MISMATCH`.
-5. Verify every retained cloud session reports the new key id before securely
-   deleting the retired private JWK.
+   `GATEWAY_KEY_MISMATCH`. Verify every retained cloud session reports the new
+   key id before securely deleting the retired private JWK.
+7. After signed lease/heartbeat health is verified on `<NEW_GATEWAY_ID>`, remove
+   the retired HMAC mapping:
 
-Rotate HMAC authentication separately: add `<NEW_GATEWAY_ID>` with
-`<NEW_HMAC_SECRET>` to `GATEWAY_HMAC_SECRETS`, move the VPS to that identity,
-verify signed lease/heartbeat health, and then remove the old mapping. Never
-reuse either HMAC secret as an encryption key.
+   ```bash
+   printf '%s' '{"<NEW_GATEWAY_ID>":"<NEW_HMAC_SECRET>"}' | npx wrangler secret put GATEWAY_HMAC_SECRETS
+   ```
+
+Never reuse either HMAC secret as an encryption key.
 
 ## 8. Destructive deletion verification
 

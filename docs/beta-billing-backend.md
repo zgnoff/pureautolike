@@ -56,6 +56,32 @@ The deployed worker returns `BETA` access while `BETA_ENABLED=true`. If the
 worker is unavailable or returns `access=false`, the extension blocks runner
 startup.
 
+## Controlled Cloud Gateway Test
+
+The cloud gateway remains a disabled, owner-only test. Keep the Worker setting
+exactly as follows until the protocol fixture stop gate in
+[cloud-gateway-runbook.md](cloud-gateway-runbook.md) is satisfied:
+
+```toml
+CLOUD_TEST_ENABLED = "false"
+```
+
+The browser sends an encrypted Pure credential envelope pinned to the gateway
+public key. The gateway private key is a server secret. The service processes
+the decrypted session credential in memory; it never asks for or receives a
+Pure password. A shared gateway IP can cause Pure to restrict or block every
+test account using that IP, so only owner-operated test accounts may be placed
+in `CLOUD_TEST_ACCOUNT_IDS` during the controlled test.
+
+For the known deployed database, which predates all cloud gateway tables, apply
+the complete current `schema.sql`; its `CREATE TABLE IF NOT EXISTS` statements
+create the cloud tables. Only an intermediate installation that already has an
+older `bridge_cloud_sessions` or `bridge_gateway_nonces` table needs the reviewed
+intermediate-schema migration. Do not describe every existing production
+database as requiring that migration, and do not apply the bootstrap schema over
+an incompatible intermediate table. The inspection and conditional commands are
+in the runbook.
+
 ## Chrome Web Store Notes
 
 Before switching to paid access:
