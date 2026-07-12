@@ -21,6 +21,7 @@ const sharedPaths = [
   'README.ru.md',
   'SECURITY.md',
   'src/background.js',
+  'src/cloud-session-envelope.js',
   'src/content.css',
   'src/content.js',
   'src/icons',

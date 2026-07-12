@@ -46,6 +46,7 @@
   "web_accessible_resources": [
     {
       "resources": [
+        "src/cloud-session-envelope.js",
         "src/page-bridge.js"
       ],
       "matches": [

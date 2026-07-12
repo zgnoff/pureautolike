@@ -268,12 +268,20 @@
       return;
     }
     if (root.querySelector('script[data-pal-page-bridge]')) return;
-    const script = document.createElement('script');
-    script.dataset.palPageBridge = '1';
-    script.dataset.palChannel = BRIDGE_CHANNEL;
-    script.src = ext.runtime.getURL('src/page-bridge.js');
-    script.onload = () => script.remove();
-    (document.head || root).appendChild(script);
+    if (root.querySelector('script[data-pal-cloud-envelope]')) return;
+    const envelopeScript = document.createElement('script');
+    envelopeScript.dataset.palCloudEnvelope = '1';
+    envelopeScript.src = ext.runtime.getURL('src/cloud-session-envelope.js');
+    envelopeScript.onload = () => {
+      envelopeScript.remove();
+      const bridgeScript = document.createElement('script');
+      bridgeScript.dataset.palPageBridge = '1';
+      bridgeScript.dataset.palChannel = BRIDGE_CHANNEL;
+      bridgeScript.src = ext.runtime.getURL('src/page-bridge.js');
+      bridgeScript.onload = () => bridgeScript.remove();
+      (document.head || root).appendChild(bridgeScript);
+    };
+    (document.head || root).appendChild(envelopeScript);
   }
 
   function imageHashesFromUrls(images) {

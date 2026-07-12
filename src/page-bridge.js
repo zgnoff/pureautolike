@@ -507,11 +507,75 @@
     return merged;
   }
 
+  function validGatewayPublicKey(value) {
+    const coordinatePattern = /^[A-Za-z0-9_-]{43}$/;
+    return !!(
+      value &&
+      value.kty === 'EC' &&
+      value.crv === 'P-256' &&
+      typeof value.x === 'string' && coordinatePattern.test(value.x) &&
+      typeof value.y === 'string' && coordinatePattern.test(value.y) &&
+      value.d === undefined
+    );
+  }
+
+  function publishCloudSessionResult(requestId, result) {
+    window.postMessage({
+      source: 'pal-page-bridge',
+      channel: CHANNEL,
+      type: 'cloud-session-result',
+      requestId: String(requestId || ''),
+      ...result
+    }, '*');
+  }
+
+  function allowlistedCloudSession() {
+    return {
+      bearer: String(state.bearer || ''),
+      xJsUserAgent: String(state.xJsUa || '')
+    };
+  }
+
+  async function exportCloudSession(data) {
+    try {
+      const accountBinding = String(data.accountBinding || '');
+      const bearerAccount = decodeBearerUserId(state.bearer);
+      const createdAt = Number(data.createdAt);
+      if (!state.bearer || !bearerAccount) throw new Error('Pure session is not ready');
+      if (!validGatewayPublicKey(data.gatewayPublicKey)) throw new Error('Invalid gateway public key');
+      if (!accountBinding || accountBinding !== bearerAccount) throw new Error('Account binding mismatch');
+      if (!Number.isSafeInteger(createdAt) || Math.abs(Date.now() - createdAt) > 30000) {
+        throw new Error('Cloud session request expired');
+      }
+      if (!globalThis.PalCloudEnvelope || typeof globalThis.PalCloudEnvelope.encryptSession !== 'function') {
+        throw new Error('Cloud session encryption unavailable');
+      }
+      const envelope = await globalThis.PalCloudEnvelope.encryptSession({
+        gatewayPublicKey: data.gatewayPublicKey,
+        keyId: String(data.keyId || ''),
+        accountBinding,
+        createdAt,
+        session: allowlistedCloudSession()
+      });
+      publishCloudSessionResult(data.requestId, {ok: true, envelope});
+    } catch (error) {
+      publishCloudSessionResult(data.requestId, {
+        ok: false,
+        error: error && error.message ? error.message : 'Cloud session export failed'
+      });
+    }
+  }
+
   window.addEventListener('message', event => {
     if (event.source !== window) return;
     const data = event.data || {};
     if (data.source !== 'pal-content') return;
     if (data.channel !== CHANNEL) return;
+
+    if (data.type === 'cloud-session-export') {
+      exportCloudSession(data);
+      return;
+    }
 
     if (data.type === 'get-token') {
       publishToken();
