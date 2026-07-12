@@ -1,3 +1,5 @@
+import {readBoundedBody} from './bounded-body.js';
+
 const JSON_HEADERS = {
   'Content-Type': 'application/json; charset=utf-8',
   'Cache-Control': 'no-store'
@@ -56,14 +58,6 @@ function constantTimeHexEqual(left, right) {
     difference |= (a[index] || 0) ^ (b[index] || 0);
   }
   return difference === 0;
-}
-
-async function readBody(request) {
-  const declared = request.headers.get('content-length');
-  if (/^\d+$/.test(declared || '') && Number(declared) > MAX_REQUEST_BYTES) throw new Error('INVALID_REQUEST');
-  const bytes = new Uint8Array(await request.arrayBuffer());
-  if (bytes.byteLength > MAX_REQUEST_BYTES) throw new Error('INVALID_REQUEST');
-  return bytes;
 }
 
 async function expectedSignature(secret, canonical) {
@@ -156,6 +150,32 @@ async function acquireLeases(env, gatewayId, requestedLimit, now, randomUUID) {
   const nowIso = now.toISOString();
   const expiresAt = new Date(now.getTime() + LEASE_MILLISECONDS).toISOString();
   for (const candidate of candidates?.results || []) {
+    let envelope;
+    try {
+      envelope = JSON.parse(String(candidate.envelope_ciphertext || ''));
+    } catch (_) {
+      continue;
+    }
+    const lease = {
+      account_id: String(candidate.account_id),
+      state: String(candidate.status),
+      lease_expires_at: expiresAt,
+      envelope
+    };
+    const proposed = {ok: true, leases: [...leases, lease]};
+    if (encoder.encode(JSON.stringify(proposed)).byteLength > MAX_RESPONSE_BYTES) break;
+
+    const renewed = await env.DB.prepare(`
+      UPDATE bridge_gateway_leases
+      SET expires_at = ?
+      WHERE account_id = ? AND device_id = ? AND gateway_id = ?
+        AND released_at IS NULL AND expires_at > ?
+    `).bind(expiresAt, candidate.account_id, candidate.active_device_id, gatewayId, nowIso).run();
+    if (renewed?.meta?.changes === 1) {
+      leases.push(lease);
+      continue;
+    }
+
     const leaseId = `lease_${randomUUID()}`;
     const leaseTokenHash = await sha256(encoder.encode(`${leaseId}\n${gatewayId}\n${randomUUID()}`));
     const acquired = await env.DB.prepare(`
@@ -190,27 +210,6 @@ async function acquireLeases(env, gatewayId, requestedLimit, now, randomUUID) {
       nowIso
     ).run();
     if (acquired?.meta?.changes !== 1) continue;
-
-    let envelope;
-    try {
-      envelope = JSON.parse(String(candidate.envelope_ciphertext || ''));
-    } catch (_) {
-      await env.DB.prepare(`UPDATE bridge_gateway_leases SET released_at = ? WHERE id = ?`)
-        .bind(nowIso, leaseId).run();
-      continue;
-    }
-    const lease = {
-      account_id: String(candidate.account_id),
-      state: String(candidate.status),
-      lease_expires_at: expiresAt,
-      envelope
-    };
-    const proposed = {ok: true, leases: [...leases, lease]};
-    if (encoder.encode(JSON.stringify(proposed)).byteLength > MAX_RESPONSE_BYTES) {
-      await env.DB.prepare(`UPDATE bridge_gateway_leases SET released_at = ? WHERE id = ?`)
-        .bind(nowIso, leaseId).run();
-      break;
-    }
     leases.push(lease);
   }
   return json({ok: true, leases});
@@ -256,9 +255,11 @@ export function createGatewayControl(options = {}) {
       try {
         let bodyBytes;
         try {
-          bodyBytes = await readBody(request);
-        } catch (_) {
-          return errorResponse('GATEWAY_INVALID_REQUEST', 400);
+          bodyBytes = await readBoundedBody(request, MAX_REQUEST_BYTES);
+        } catch (error) {
+          return error.message === 'BODY_TOO_LARGE'
+            ? errorResponse('GATEWAY_BODY_TOO_LARGE', 413)
+            : errorResponse('GATEWAY_INVALID_REQUEST', 400);
         }
         const current = now();
         const auth = await authenticate(request, env, url, bodyBytes, current);

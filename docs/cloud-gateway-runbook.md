@@ -166,8 +166,8 @@ Run local checks without any Pure credentials or network calls to Pure:
 npm run validate
 npm run audit:clean
 npm run build
+npm --prefix backend/license-worker test
 npm --prefix backend/license-worker run check
-node tests/cloud-gateway-worker.mjs
 npm --prefix backend/pure-gateway test
 npm --prefix backend/pure-gateway run check
 git diff --check

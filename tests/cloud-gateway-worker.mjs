@@ -7,6 +7,7 @@ import {createFakeD1} from './helpers/fake-d1.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const schema = await readFile(resolve(root, 'backend/license-worker/schema.sql'), 'utf8');
+const workerWrangler = await readFile(resolve(root, 'backend/license-worker/wrangler.toml'), 'utf8');
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -321,6 +322,7 @@ let accountStatus = 'active';
 let deviceStatus = 'active';
 let consentWarningVersion = '';
 let storedCloudSession = null;
+let activeConnectorState = null;
 let forceAtomicZeroChanges = false;
 let deleteAfterAtomicUpsert = false;
 cloudDb.when('FROM bridge_sessions s', () => ({
@@ -340,6 +342,11 @@ cloudDb.when('INSERT INTO bridge_cloud_consents', ({params}) => {
   return {success: true, meta: {changes: 1}};
 });
 cloudDb.when('FROM bridge_cloud_sessions', () => storedCloudSession);
+cloudDb.when('FROM bridge_gateway_leases', () => activeConnectorState ? ({
+  connector_state: activeConnectorState,
+  heartbeat_at: '2026-07-12T12:00:00.000Z',
+  lease_expires_at: '2026-07-12T12:01:00.000Z'
+}) : null);
 cloudDb.when('INSERT INTO bridge_cloud_sessions', ({sql, params}) => {
   if (forceAtomicZeroChanges) return {success: true, meta: {changes: 0}};
   const isRotation = !!storedCloudSession;
@@ -562,6 +569,29 @@ const cancelRejectingOversizeResponse = await cloudBridge.handle(new Request('ht
 }), cloudEnv());
 assert(cancelRejectingOversizeResponse.status === 413, 'reader cancellation rejection must not replace a proven oversize 413');
 
+let genericBodyCanceled = false;
+let genericBodyPulls = 0;
+const genericOversizeStream = new ReadableStream({
+  pull(controller) {
+    genericBodyPulls += 1;
+    if (genericBodyPulls <= 2) controller.enqueue(new Uint8Array(9000));
+    else controller.close();
+  },
+  cancel() {
+    genericBodyCanceled = true;
+    throw new Error('seeded generic cancel rejection');
+  }
+});
+const genericOversizeResponse = await cloudBridge.handle(new Request('https://worker.example/v1/device/challenge', {
+  method: 'POST',
+  headers: {'Content-Type': 'application/json'},
+  body: genericOversizeStream,
+  duplex: 'half'
+}), cloudEnv());
+assert(genericOversizeResponse.status === 413, 'generic JSON routes must stream-bound bodies at 16 KiB');
+assert((await genericOversizeResponse.json()).code === 'BODY_TOO_LARGE', 'generic oversized JSON must preserve BODY_TOO_LARGE');
+assert(genericBodyCanceled, 'generic oversized JSON must best-effort cancel its reader');
+
 for (const createdAt of [cloudNow.getTime() - 30001, cloudNow.getTime() + 30001]) {
   const response = await callCloud('/v1/cloud/session', {
     method: 'PUT',
@@ -618,9 +648,16 @@ assert(!cloudDb.calls.some(call => /^\s*UPDATE bridge_cloud_sessions/.test(call.
 
 const statusResponse = await callCloud('/v1/cloud/status');
 const status = await statusResponse.json();
-assert(statusResponse.status === 200 && status.configured === true && status.status === 'pending', 'status must report configured cloud state');
+assert(statusResponse.status === 200 && status.configured === true && status.session_status === 'pending', 'status must report the cloud session lifecycle separately');
+assert(status.connector_state === null, 'status without an owned live lease must not fabricate connector health');
 assert(status.gateway_key_id === 'gateway-key-2026-07' && status.credential_fingerprint_hash === 'fingerprint-hash-2', 'status must expose only redacted metadata');
 assert(!Object.hasOwn(status, 'envelope_ciphertext') && !Object.hasOwn(status, 'ciphertext') && !JSON.stringify(status).includes('D'.repeat(32)), 'status must never return stored ciphertext');
+
+activeConnectorState = 'compatibility_required';
+const connectorStatus = await (await callCloud('/v1/cloud/status')).json();
+assert(connectorStatus.session_status === 'pending', 'gateway heartbeat must not rewrite the session lifecycle');
+assert(connectorStatus.connector_state === 'compatibility_required', 'status must expose latest owned unexpired connector state');
+assert(connectorStatus.connector_heartbeat_at === '2026-07-12T12:00:00.000Z', 'status must expose the connector heartbeat timestamp');
 
 const deleteResponse = await callCloud('/v1/cloud/session', {method: 'DELETE'});
 assert(deleteResponse.status === 200 && (await deleteResponse.json()).configured === false, 'deactivation must report unconfigured');
@@ -629,5 +666,8 @@ for (const table of ['bridge_gateway_leases', 'bridge_media_transfers', 'bridge_
 }
 const repeatedDeleteResponse = await callCloud('/v1/cloud/session', {method: 'DELETE'});
 assert(repeatedDeleteResponse.status === 200 && (await repeatedDeleteResponse.json()).configured === false, 'deactivation must be idempotent');
+
+assert(/^CLOUD_TEST_ENABLED\s*=\s*"false"$/m.test(workerWrangler), 'actual Worker config must keep cloud test mode disabled');
+assert(/^CLOUD_TEST_ACCOUNT_IDS\s*=\s*""$/m.test(workerWrangler), 'actual Worker config must keep the cloud test allowlist empty');
 
 console.log('cloud gateway schema contract passed');

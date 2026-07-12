@@ -3,6 +3,7 @@ import {createHash, createHmac} from 'node:crypto';
 
 import worker from '../backend/license-worker/src/worker.js';
 import {createGatewayControl} from '../backend/license-worker/src/gateway-control.js';
+import {ConnectorManager} from '../backend/pure-gateway/src/connector-manager.js';
 
 const NOW = new Date('2026-07-12T12:00:00.000Z');
 const SECRET = 'gateway-control-secret-value-32-bytes';
@@ -94,6 +95,13 @@ function createGatewayDb() {
               lease_token_hash: tokenHash, connector_state: 'disabled', heartbeat_at: null,
               expires_at: expiresAt, released_at: null
             });
+            return {success: true, meta: {changes: 1}};
+          }
+          if (sql.includes('UPDATE bridge_gateway_leases') && sql.includes('SET expires_at')) {
+            const [expiresAt, accountId, deviceId, gatewayId, nowIso] = params;
+            const lease = leases.find(item => item.account_id === accountId && item.device_id === deviceId && item.gateway_id === gatewayId && !item.released_at && Date.parse(item.expires_at) > Date.parse(nowIso));
+            if (!lease) return {success: true, meta: {changes: 0}};
+            lease.expires_at = expiresAt;
             return {success: true, meta: {changes: 1}};
           }
           if (sql.includes('UPDATE bridge_gateway_leases') && sql.includes('SET released_at')) {
@@ -224,9 +232,13 @@ for (const request of [
 {
   const db = createGatewayDb();
   const first = await call(signedRequest('/internal/gateway/leases', {gateway_id: 'gateway-1', limit: 20}), db);
-  const exclusive = await call(signedRequest('/internal/gateway/leases', {gateway_id: 'gateway-1', limit: 20}), db);
+  const renewed = await call(signedRequest('/internal/gateway/leases', {gateway_id: 'gateway-1', limit: 20}), db);
   assert.equal(first.body.leases.length, 1);
-  assert.equal(exclusive.body.leases.length, 0, 'an unexpired lease must be exclusive');
+  assert.equal(renewed.body.leases.length, 1, 'the owning gateway must receive and renew its active lease on every poll');
+  const exclusive = await call(signedRequest('/internal/gateway/leases', {gateway_id: 'gateway-2', limit: 20}, {
+    gatewayId: 'gateway-2', secret: SECRET_TWO
+  }), db);
+  assert.equal(exclusive.body.leases.length, 0, 'an unexpired lease must remain exclusive against other gateways');
   assert.equal(Date.parse(first.body.leases[0].lease_expires_at) - NOW.getTime(), 60_000, 'lease must last exactly 60 seconds');
   db.leases[0].expires_at = new Date(NOW.getTime() - 1).toISOString();
   const expired = await call(signedRequest('/internal/gateway/leases', {gateway_id: 'gateway-1', limit: 20}), db);
@@ -248,7 +260,7 @@ for (const request of [
   }
 
   const heldCycle = await call(signedRequest('/internal/gateway/leases', {gateway_id: 'gateway-1', limit: 20}), db);
-  assert.equal(heldCycle.body.leases.length, 0, 'the second cycle must respect the current exclusive lease');
+  assert.equal(heldCycle.body.leases.length, 1, 'the second owner cycle must retain its desired connector');
   db.leases[0].expires_at = new Date(NOW.getTime() - 1).toISOString();
   const secondCycle = await call(signedRequest('/internal/gateway/leases', {gateway_id: 'gateway-1', limit: 20}), db);
   assert.equal(secondCycle.body.leases.length, 1, 'the next normal cycle must reacquire after lease expiry');
@@ -264,6 +276,79 @@ for (const request of [
     assert.equal(rejected.body.code, 'GATEWAY_INVALID_HEARTBEAT');
     assert(!JSON.stringify(rejected.body).includes('credential-secret'));
   }
+}
+
+{
+  const db = createGatewayDb();
+  const manager = new ConnectorManager({
+    privateJwk: {},
+    keyId: 'key-1',
+    decrypt: async () => ({bearer: 'temporary', xJsUserAgent: 'temporary-agent'})
+  });
+  const firstPoll = await call(signedRequest('/internal/gateway/leases', {gateway_id: 'gateway-1', limit: 20}), db);
+  const firstSnapshot = await manager.reconcile(firstPoll.body.leases);
+  assert.deepEqual(firstSnapshot, [{account_id: 'account-active', state: 'compatibility_required'}]);
+  assert.equal((await call(signedRequest('/internal/gateway/heartbeat', {
+    gateway_id: 'gateway-1', connectors: firstSnapshot
+  }), db)).response.status, 200);
+
+  const secondPoll = await call(signedRequest('/internal/gateway/leases', {gateway_id: 'gateway-1', limit: 20}), db);
+  assert.equal(secondPoll.body.leases.length, 1, 'two normal gateway cycles must retain ownership and desired state');
+  assert.deepEqual(await manager.reconcile(secondPoll.body.leases), firstSnapshot);
+
+  const otherGateway = await call(signedRequest('/internal/gateway/leases', {gateway_id: 'gateway-2', limit: 20}, {
+    gatewayId: 'gateway-2', secret: SECRET_TWO
+  }), db);
+  assert.deepEqual(otherGateway.body.leases, [], 'another gateway must remain excluded while the owner lease is live');
+
+  db.leases[0].expires_at = new Date(NOW.getTime() - 1).toISOString();
+  const reacquired = await call(signedRequest('/internal/gateway/leases', {gateway_id: 'gateway-1', limit: 20}), db);
+  assert.equal(reacquired.body.leases.length, 1, 'the owner must atomically reacquire after expiry');
+
+  db.sessions.length = 0;
+  const deletedPoll = await call(signedRequest('/internal/gateway/leases', {gateway_id: 'gateway-1', limit: 20}), db);
+  assert.deepEqual(deletedPoll.body.leases, []);
+  const cleanupSnapshot = await manager.reconcile(deletedPoll.body.leases);
+  assert.deepEqual(cleanupSnapshot, [], 'an omitted deleted connector must be removed after its cleanup transition');
+  const emptyHeartbeat = await call(signedRequest('/internal/gateway/heartbeat', {
+    gateway_id: 'gateway-1', connectors: cleanupSnapshot
+  }), db);
+  assert.equal(emptyHeartbeat.response.status, 200, 'deletion must converge to an empty heartbeat without failures');
+}
+
+{
+  const oversizedText = JSON.stringify({gateway_id: 'gateway-1', limit: 20, padding: 'x'.repeat(70_000)});
+  const chunks = [encoder.encode(oversizedText.slice(0, 40_000)), encoder.encode(oversizedText.slice(40_000))];
+  let cancelled = false;
+  let chunkIndex = 0;
+  const body = new ReadableStream({
+    pull(controller) {
+      if (chunkIndex < chunks.length) controller.enqueue(chunks[chunkIndex++]);
+      else controller.close();
+    },
+    cancel() {
+      cancelled = true;
+      throw new Error('seeded internal cancel rejection');
+    }
+  });
+  const timestamp = String(Math.floor(NOW.getTime() / 1000));
+  const nonce = 'oversized-stream-nonce';
+  const request = new Request('https://worker.example/internal/gateway/leases', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-gateway-id': 'gateway-1',
+      'x-gateway-timestamp': timestamp,
+      'x-gateway-nonce': nonce,
+      'x-gateway-signature': signature({path: '/internal/gateway/leases', timestamp, nonce, body: oversizedText})
+    },
+    body,
+    duplex: 'half'
+  });
+  const response = await control.handle(request, envFor(createGatewayDb()));
+  assert.equal(response.status, 413, 'chunked internal bodies over 64 KiB must return 413 before authentication');
+  assert.deepEqual(await response.json(), {ok: false, code: 'GATEWAY_BODY_TOO_LARGE'});
+  assert(cancelled, 'internal oversized body cancellation must be best-effort and preserve 413 on rejection');
 }
 
 {

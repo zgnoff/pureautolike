@@ -383,7 +383,7 @@ test('reconciles only foundation connector states and never exposes decrypted cr
   assert.deepEqual(snapshots, [{account_id: ACCOUNT_ID, state: 'compatibility_required'}]);
   assert(!JSON.stringify({transitions, snapshots}).includes(SEEDED_BEARER));
 
-  assert.deepEqual(await manager.reconcile([]), [{account_id: ACCOUNT_ID, state: 'disabled'}]);
+  assert.deepEqual(await manager.reconcile([]), [], 'omitted connectors must leave heartbeat snapshots after one cleanup transition');
   assert.deepEqual(
     await manager.reconcile([{account_id: ACCOUNT_ID, revoked: true}]),
     [{account_id: ACCOUNT_ID, state: 'revoked'}]

@@ -10,6 +10,8 @@ preview_urls = false
 BETA_ENABLED = "true"
 CHECKOUT_URL = ""
 ALLOWED_EXTENSION_IDS = "abamkpcdpihjpaomdpaklhifpfbobgmm"
+CLOUD_TEST_ENABLED = "false"
+CLOUD_TEST_ACCOUNT_IDS = ""
 WEBHOOK_SECRET = ""
 
 [[d1_databases]]

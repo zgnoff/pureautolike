@@ -83,9 +83,9 @@ export class ConnectorManager {
       }
     }
     for (const connector of this.#connectors.values()) {
-      if (!present.has(connector.accountId) && connector.state !== 'disabled') {
-        this.#transition(connector.accountId, 'disabled');
-      }
+      if (present.has(connector.accountId)) continue;
+      if (connector.state !== 'disabled') this.#transition(connector.accountId, 'disabled');
+      this.#connectors.delete(connector.accountId);
     }
     return this.snapshot();
   }
