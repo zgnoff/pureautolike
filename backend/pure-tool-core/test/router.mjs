@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {createRegistry, createRouter, CORE_TOOL_DEFINITIONS, toolError} from '../src/index.js';
+import {createRegistry, createRouter, CORE_TOOL_DEFINITIONS, ToolCoreError, toolError} from '../src/index.js';
 
 const registry = createRegistry(CORE_TOOL_DEFINITIONS);
 const executor = (name, state = 'online', behavior = async operation => ({name, operation})) => ({
@@ -43,4 +43,137 @@ test('does not send arbitrary operation data to an unregistered executor', async
   const router = createRouter({executors: {unknown: executor('unknown')}});
   const definition = {...registry.get('pure.chats.list'), implemented: true};
   await assert.rejects(router.execute(definition, {}, {}), {code: 'gateway_offline'});
+});
+
+test('normalizes health to frozen owned enum values without retaining executor output', async () => {
+  const secret = {state: 'online', secret: 'do-not-retain'};
+  const router = createRouter({executors: {
+    gateway: executor('gateway', secret),
+    extension: executor('extension', 'reauth_required')
+  }});
+  const health = await router.health();
+  assert.deepEqual(health, {gateway: 'offline', extension: 'reauth_required'});
+  assert.equal(Object.isFrozen(health), true);
+  assert.equal(Object.getPrototypeOf(health), Object.prototype);
+  assert.equal(health.gateway === secret, false);
+
+  const throwing = createRouter({executors: {
+    gateway: executor('gateway', 'online', async () => null),
+    extension: {async health() { throw new Error('secret'); }, async execute() {}}
+  }});
+  assert.deepEqual(await throwing.health(), {gateway: 'online', extension: 'offline'});
+});
+
+test('returns fresh canonical errors without executor-owned fields or causes', async () => {
+  const owned = toolError('provider_rate_limited', {retryable: true, retryAfterMs: 25});
+  owned.secret = 'do-not-leak';
+  owned.cause = new Error('provider secret');
+  const definition = {...registry.get('pure.chats.list'), implemented: true};
+  const router = createRouter({executors: {
+    gateway: executor('gateway', 'online', async () => { throw owned; })
+  }});
+  const caught = await router.execute(definition, {}, {}).catch(error => error);
+  assert.equal(caught instanceof ToolCoreError, true);
+  assert.notEqual(caught, owned);
+  assert.equal(caught.code, 'provider_rate_limited');
+  assert.equal(caught.retryable, true);
+  assert.equal(caught.retryAfterMs, 25);
+  assert.equal(Object.hasOwn(caught, 'secret'), false);
+  assert.equal(Object.hasOwn(caught, 'cause'), false);
+
+  const hostile = new Proxy(owned, {ownKeys() { throw new Error('proxy secret'); }});
+  const rejected = createRouter({executors: {
+    gateway: executor('gateway', 'online', async () => { throw hostile; })
+  }});
+  await assert.rejects(rejected.execute(definition, {}, {}), error =>
+    error instanceof ToolCoreError && error.code === 'executor_rejected' && !Object.hasOwn(error, 'secret')
+  );
+});
+
+test('health-based failover reaches a secondary only for safe operations', async () => {
+  let extensionCalls = 0;
+  const router = createRouter({executors: {
+    gateway: executor('gateway', 'offline'),
+    extension: executor('extension', 'online', async () => { extensionCalls += 1; return 'ok'; })
+  }});
+  const safe = {...registry.get('pure.chats.list'), implemented: true, executors: ['gateway', 'extension']};
+  assert.equal((await router.execute(safe, {}, {})).executor, 'extension');
+  const mutation = {...registry.get('pure.discovery.reaction.like'), implemented: true, executors: ['gateway', 'extension']};
+  await assert.rejects(router.execute(mutation, {}, {}), {code: 'gateway_offline'});
+  assert.equal(extensionCalls, 1);
+});
+
+test('reauth and compatibility health states fail exactly without failover', async () => {
+  const definition = {...registry.get('pure.chats.list'), implemented: true, executors: ['gateway', 'extension']};
+  for (const state of ['reauth_required', 'compatibility_required']) {
+    let extensionCalls = 0;
+    const router = createRouter({executors: {
+      gateway: executor('gateway', state),
+      extension: executor('extension', 'online', async () => { extensionCalls += 1; })
+    }});
+    await assert.rejects(router.execute(definition, {}, {}), error =>
+      error instanceof ToolCoreError && error.code === state && error.message === state
+    );
+    assert.equal(extensionCalls, 0);
+  }
+});
+
+test('uses only a declared online preferred executor and otherwise preserves gateway order', async () => {
+  const definition = {...registry.get('pure.chats.list'), implemented: true, executors: ['gateway', 'extension']};
+  const online = createRouter({executors: {
+    gateway: executor('gateway'), extension: executor('extension')
+  }});
+  assert.equal((await online.execute(definition, {}, {preferredExecutor: 'extension'})).executor, 'extension');
+
+  const offlinePreferred = createRouter({executors: {
+    gateway: executor('gateway'), extension: executor('extension', 'offline')
+  }});
+  assert.equal((await offlinePreferred.execute(definition, {}, {preferredExecutor: 'extension'})).executor, 'gateway');
+  assert.equal((await online.execute({...definition, executors: ['gateway']}, {}, {preferredExecutor: 'extension'})).executor, 'gateway');
+});
+
+test('rejects null, invalid, accessor, and hostile preferred executor contexts canonically', async () => {
+  const definition = {...registry.get('pure.chats.list'), implemented: true};
+  const router = createRouter({executors: {gateway: executor('gateway')}});
+  let getterCalls = 0;
+  const accessor = Object.defineProperty({}, 'preferredExecutor', {
+    enumerable: true,
+    get() { getterCalls += 1; return 'gateway'; }
+  });
+  const hostile = new Proxy({}, {getOwnPropertyDescriptor() { throw new Error('context secret'); }});
+  for (const context of [null, {preferredExecutor: 'other'}, accessor, hostile]) {
+    await assert.rejects(router.execute(definition, {}, context), error =>
+      error instanceof ToolCoreError && error.code === 'invalid_input' && error.message === 'invalid_input'
+    );
+  }
+  assert.equal(getterCalls, 0);
+});
+
+test('preserves the primary offline error when every declared executor is offline', async () => {
+  const router = createRouter({executors: {
+    gateway: executor('gateway', 'offline'), extension: executor('extension', 'offline')
+  }});
+  const definition = {...registry.get('pure.chats.list'), implemented: true, executors: ['gateway', 'extension']};
+  await assert.rejects(router.execute(definition, {}, {}), {code: 'gateway_offline'});
+});
+
+test('ignores hostile executor descriptors without invoking getters or leaking errors', async () => {
+  let getterCalls = 0;
+  const accessorExecutor = Object.defineProperty({}, 'health', {
+    get() { getterCalls += 1; throw new Error('getter secret'); }
+  });
+  Object.defineProperty(accessorExecutor, 'execute', {value: async () => 'bad'});
+  const proxyExecutor = new Proxy({}, {
+    getOwnPropertyDescriptor() { throw new Error('descriptor secret'); }
+  });
+  const router = createRouter({executors: {gateway: accessorExecutor, extension: proxyExecutor}});
+  assert.deepEqual(await router.health(), {gateway: 'offline', extension: 'offline'});
+  assert.equal(getterCalls, 0);
+
+  let optionsGetterCalls = 0;
+  const options = Object.defineProperty({}, 'executors', {
+    get() { optionsGetterCalls += 1; throw new Error('options secret'); }
+  });
+  assert.deepEqual(await createRouter(options).health(), {gateway: 'offline', extension: 'offline'});
+  assert.equal(optionsGetterCalls, 0);
 });
