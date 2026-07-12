@@ -1,9 +1,12 @@
+import {createGatewayControl} from './gateway-control.js';
+
 const JSON_HEADERS = {
   'Content-Type': 'application/json; charset=utf-8',
   'Cache-Control': 'no-store'
 };
 
 const PRIVACY_URL = 'https://zgnme.github.io/pureautolike/privacy/';
+const gatewayControl = createGatewayControl();
 
 export default {
   async fetch(request, env) {
@@ -11,6 +14,9 @@ export default {
     const url = new URL(request.url);
 
     try {
+      const gatewayResponse = await gatewayControl.handle(request, env);
+      if (gatewayResponse) return gatewayResponse;
+
       if ((request.method === 'GET' || request.method === 'HEAD') && (url.pathname === '/privacy' || url.pathname === '/privacy.html')) {
         return Response.redirect(PRIVACY_URL, 301);
       }

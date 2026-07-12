@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "wrangler dev src/worker.js",
     "deploy": "wrangler deploy src/worker.js",
-    "check": "node --check src/worker.js"
+    "test": "node ../../tests/gateway-control-worker.mjs",
+    "check": "node --check src/worker.js && node --check src/gateway-control.js"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"
