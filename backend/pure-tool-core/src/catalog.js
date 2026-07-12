@@ -6,6 +6,30 @@ function deepFreeze(value, seen = new WeakSet()) {
 }
 
 const EMPTY_INPUT = deepFreeze({type: 'object', properties: {}, additionalProperties: false});
+const EMPTY_OUTPUT = deepFreeze({type: 'object', properties: {}, additionalProperties: false});
+
+const CAPABILITIES_OUTPUT = deepFreeze({
+  type: 'array',
+  items: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['name', 'schemaVersion', 'executors', 'scopes', 'confirmation', 'availability'],
+    properties: {
+      name: {type: 'string'},
+      schemaVersion: {type: 'string', enum: ['1']},
+      executors: {
+        type: 'array', minItems: 1, maxItems: 3,
+        items: {type: 'string', enum: ['core', 'gateway', 'extension']}
+      },
+      scopes: {type: 'array', minItems: 1, maxItems: 100, items: {type: 'string'}},
+      confirmation: {type: 'string', enum: ['none', 'grant', 'dangerous']},
+      availability: {
+        type: 'string',
+        enum: ['available', 'not_implemented', 'gateway_offline', 'extension_offline']
+      }
+    }
+  }
+});
 
 const idInput = key => deepFreeze({
   type: 'object', additionalProperties: false, required: [key],
@@ -31,7 +55,8 @@ function define(name, options = {}) {
     mutation: options.mutation || 'read',
     safeFailover: options.safeFailover === true,
     implemented: options.implemented === true,
-    inputSchema: options.inputSchema || EMPTY_INPUT
+    inputSchema: options.inputSchema || EMPTY_INPUT,
+    outputSchema: options.outputSchema || EMPTY_OUTPUT
   });
 }
 
@@ -44,7 +69,9 @@ const dangerous = (name, scope, options = {}) => define(name, {
 });
 
 export const CORE_TOOL_DEFINITIONS = Object.freeze([
-  read('system.capabilities.list', {executors: ['core'], implemented: true}),
+  read('system.capabilities.list', {
+    executors: ['core'], implemented: true, outputSchema: CAPABILITIES_OUTPUT
+  }),
   read('system.operation.get', {executors: ['core'], inputSchema: idInput('requestId')}),
   read('system.workflow.get', {executors: ['core'], inputSchema: idInput('workflowId')}),
   grant('system.workflow.cancel', 'pure:read', {executors: ['core'], inputSchema: idInput('workflowId')}),

@@ -74,6 +74,7 @@ const EXPECTED_NAMES = [
 ];
 
 const EMPTY_INPUT = {type: 'object', properties: {}, additionalProperties: false};
+const EMPTY_OUTPUT = {type: 'object', properties: {}, additionalProperties: false};
 
 function definition(name, options = {}) {
   return {
@@ -87,6 +88,7 @@ function definition(name, options = {}) {
     safeFailover: true,
     implemented: true,
     inputSchema: EMPTY_INPUT,
+    outputSchema: EMPTY_OUTPUT,
     ...options
   };
 }
@@ -100,6 +102,8 @@ test('registers every version-1 tool with explicit safety metadata', () => {
     assert.equal(item.schemaVersion, '1');
     assert(item.executors.length > 0);
     assert(Array.isArray(item.scopes));
+    assert(Object.hasOwn(item, 'outputSchema'));
+    assert(Object.isFrozen(item.outputSchema));
     if (item.mutation === 'destructive') assert.equal(item.confirmation, 'dangerous');
   }
 });
@@ -107,11 +111,18 @@ test('registers every version-1 tool with explicit safety metadata', () => {
 test('deep-freezes canonical schemas', () => {
   const profile = CORE_TOOL_DEFINITIONS.find(item => item.name === 'pure.discovery.profile.get');
   const matches = CORE_TOOL_DEFINITIONS.find(item => item.name === 'pure.matches.list');
+  const capabilities = CORE_TOOL_DEFINITIONS.find(item => item.name === 'system.capabilities.list');
   assert(Object.isFrozen(profile.inputSchema));
   assert(Object.isFrozen(profile.inputSchema.required));
   assert(Object.isFrozen(profile.inputSchema.properties));
   assert(Object.isFrozen(profile.inputSchema.properties.userId));
   assert(Object.isFrozen(matches.inputSchema.properties.limit));
+  assert(Object.isFrozen(capabilities.outputSchema));
+  assert(Object.isFrozen(capabilities.outputSchema.items));
+  assert(Object.isFrozen(capabilities.outputSchema.items.properties.availability.enum));
+  assert.deepEqual(capabilities.outputSchema.items.required, [
+    'name', 'schemaVersion', 'executors', 'scopes', 'confirmation', 'availability'
+  ]);
   assert.throws(() => profile.inputSchema.required.push('admin'), {name: 'TypeError'});
   assert.throws(() => { profile.inputSchema.properties.userId.maxLength = 10_000; }, {name: 'TypeError'});
 });
@@ -155,6 +166,10 @@ test('snapshots caller definitions and nested schema data', () => {
       additionalProperties: false,
       required: ['kind'],
       properties: {kind: {type: 'string', enum: ['photo']}}
+    },
+    outputSchema: {
+      type: 'object', additionalProperties: false, required: ['message'],
+      properties: {message: {type: 'string', maxLength: 100}}
     }
   });
   const registry = createRegistry([original]);
@@ -166,6 +181,7 @@ test('snapshots caller definitions and nested schema data', () => {
   original.inputSchema.required.push('admin');
   original.inputSchema.properties.kind.enum.push('secret');
   original.inputSchema.properties.admin = {type: 'boolean'};
+  original.outputSchema.properties.message.maxLength = 10_000;
 
   assert.notEqual(snapshot, original);
   assert.equal(snapshot.description, 'pure.test.snapshot');
@@ -176,6 +192,9 @@ test('snapshots caller definitions and nested schema data', () => {
   assert.equal(snapshot.inputSchema.properties.admin, undefined);
   assert(Object.isFrozen(snapshot));
   assert(Object.isFrozen(snapshot.inputSchema.properties.kind.enum));
+  assert.equal(snapshot.outputSchema.properties.message.maxLength, 100);
+  assert(Object.isFrozen(snapshot.outputSchema));
+  assert(Object.isFrozen(snapshot.outputSchema.properties.message));
   assert.equal(registry.list()[0], snapshot);
   const firstCapability = registry.capabilities({gateway: 'online'})[0];
   const secondCapability = registry.capabilities({gateway: 'online'})[0];
@@ -199,9 +218,23 @@ test('rejects incomplete and malformed explicit metadata', () => {
     {...base, inputSchema: {type: 'string'}},
     {...base, inputSchema: {type: 'object', properties: [], additionalProperties: false}},
     {...base, inputSchema: {type: 'object', properties: {}, additionalProperties: true}},
-    {...base, inputSchema: {type: 'object', properties: {}, additionalProperties: false, required: 'id'}}
+    {...base, inputSchema: {type: 'object', properties: {}, additionalProperties: false, required: 'id'}},
+    {...base, outputSchema: null},
+    {...base, outputSchema: {type: 'object', properties: {}, additionalProperties: true}},
+    {...base, outputSchema: {type: 'array'}},
+    {...base, outputSchema: {type: 'mystery'}}
   ];
   for (const value of invalid) assert.throws(() => createRegistry([value]), {code: 'invalid_input'});
+});
+
+test('requires every definition to own a closed output schema', () => {
+  const base = definition('pure.test.output_schema');
+  const missing = {...base};
+  delete missing.outputSchema;
+  assert.throws(() => createRegistry([missing]), {code: 'invalid_input'});
+  assert.throws(() => createRegistry([{...base, outputSchema: {
+    type: 'array', items: {type: 'object', properties: {}, additionalProperties: true}
+  }}]), {code: 'invalid_input'});
 });
 
 test('wraps hostile definition reflection as invalid input without leaking errors', () => {

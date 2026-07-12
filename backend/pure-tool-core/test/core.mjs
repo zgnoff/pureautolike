@@ -3,16 +3,49 @@ import test from 'node:test';
 
 import {CORE_TOOL_DEFINITIONS, createToolCore, toolError} from '../src/index.js';
 
-function definitionsWith(...implementedNames) {
-  const names = new Set(implementedNames);
-  return CORE_TOOL_DEFINITIONS.map(item => names.has(item.name) ? {...item, implemented: true} : item);
+const EMPTY_OUTPUT = Object.freeze({type: 'object', properties: {}, additionalProperties: false});
+const PROFILE_OUTPUT = Object.freeze({
+  type: 'object',
+  additionalProperties: false,
+  required: ['operation', 'userId'],
+  properties: {operation: {type: 'string'}, userId: {type: 'string'}}
+});
+const NESTED_MESSAGE_OUTPUT = Object.freeze({
+  type: 'object',
+  additionalProperties: false,
+  required: ['items'],
+  properties: {items: {
+    type: 'array',
+    items: {
+      type: 'object', additionalProperties: false, required: ['message'],
+      properties: {message: {type: 'string'}}
+    }
+  }}
+});
+const MESSAGE_OUTPUT = Object.freeze({
+  type: 'object', additionalProperties: false, required: ['message'],
+  properties: {message: {type: 'string'}}
+});
+const FIXED_REQUEST_IDS = [1, 2, 3, 4, 5].map(number =>
+  `req_00000000-0000-4000-8000-${String(number).padStart(12, '0')}`
+);
+
+function definitionsWithOutput(name, outputSchema = EMPTY_OUTPUT) {
+  return CORE_TOOL_DEFINITIONS.map(item => item.name === name
+    ? {...item, implemented: true, outputSchema}
+    : item);
 }
+
+const definitionsWith = (...implementedNames) => CORE_TOOL_DEFINITIONS.map(item =>
+  implementedNames.includes(item.name) ? {...item, implemented: true, outputSchema: EMPTY_OUTPUT} : item
+);
+const flushAudit = () => new Promise(resolve => setTimeout(resolve, 5));
 
 test('runs validation and authorization before the executor', async () => {
   let calls = 0;
   const core = createToolCore({
-    definitions: definitionsWith('pure.discovery.profile.get'),
-    requestId: () => 'req-1',
+    definitions: definitionsWithOutput('pure.discovery.profile.get', PROFILE_OUTPUT),
+    requestId: () => FIXED_REQUEST_IDS[0],
     executors: {gateway: {
       async health() { return 'online'; },
       async execute(operation, args) { calls += 1; return {operation, userId: args.userId}; }
@@ -33,7 +66,7 @@ test('runs validation and authorization before the executor', async () => {
 });
 
 test('returns honest capability and not-implemented results', async () => {
-  const core = createToolCore({definitions: CORE_TOOL_DEFINITIONS, requestId: () => 'req-2'});
+  const core = createToolCore({definitions: CORE_TOOL_DEFINITIONS, requestId: () => FIXED_REQUEST_IDS[1]});
   const capabilities = await core.invoke('system.capabilities.list', {}, {
     callerId: 'agent-1', accountId: 'account-1', scopes: ['pure:read']
   });
@@ -51,7 +84,7 @@ test('audits metadata without arguments, results, identifiers, or secrets', asyn
   const secret = 'fixture-end-to-end-secret';
   const core = createToolCore({
     definitions: definitionsWith('pure.discovery.profile.get'),
-    requestId: () => 'req-3',
+    requestId: () => FIXED_REQUEST_IDS[2],
     audit: event => events.push(event),
     executors: {gateway: {
       async health() { return 'online'; },
@@ -61,6 +94,7 @@ test('audits metadata without arguments, results, identifiers, or secrets', asyn
   const result = await core.invoke('pure.discovery.profile.get', {userId: 'private-user-id'}, {
     callerId: 'private-agent-id', accountId: 'private-account-id', scopes: ['pure:read'], callerType: 'mcp'
   });
+  await flushAudit();
   assert.equal(result.error, 'executor_rejected');
   const serialized = JSON.stringify({result, events});
   assert(!serialized.includes(secret));
@@ -87,11 +121,12 @@ test('redacts invalid operation names and hostile caller metadata from audit', a
   });
   const core = createToolCore({
     definitions: CORE_TOOL_DEFINITIONS,
-    requestId: () => 'req-4',
+    requestId: () => FIXED_REQUEST_IDS[3],
     audit: event => events.push(event)
   });
 
   const result = await core.invoke(secret, {}, context);
+  await flushAudit();
 
   assert.equal(result.error, 'operation_not_found');
   assert.equal(events[0].tool, 'invalid');
@@ -102,7 +137,7 @@ test('redacts invalid operation names and hostile caller metadata from audit', a
 test('ignores asynchronous audit rejection', async () => {
   const core = createToolCore({
     definitions: CORE_TOOL_DEFINITIONS,
-    requestId: () => 'req-5',
+    requestId: () => FIXED_REQUEST_IDS[4],
     audit: async () => { throw new Error('fixture-audit-secret'); }
   });
 
@@ -126,14 +161,15 @@ test('uses a safe fallback when request ID generation fails', async () => {
   });
 
   assert.equal(result.ok, true);
-  assert.match(result.requestId, /^req_[0-9a-f-]+$/);
+  await flushAudit();
+  assert.match(result.requestId, /^req_[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   assert.equal(events[0].requestId, result.requestId);
 });
 
 test('snapshots and deeply freezes executor output', async () => {
   const supplied = {items: [{message: 'ordinary secret planning text'}]};
   const core = createToolCore({
-    definitions: definitionsWith('pure.discovery.profile.get'),
+    definitions: definitionsWithOutput('pure.discovery.profile.get', NESTED_MESSAGE_OUTPUT),
     executors: {gateway: {
       async health() { return 'online'; },
       async execute() { return supplied; }
@@ -146,7 +182,8 @@ test('snapshots and deeply freezes executor output', async () => {
   supplied.items[0].message = 'mutated';
   supplied.items.push({message: 'late'});
   assert.equal(result.ok, true);
-  assert.deepEqual(result.data, {items: [{message: 'ordinary secret planning text'}]});
+  assert.deepEqual({...result.data}, {items: result.data.items});
+  assert.deepEqual({...result.data.items[0]}, {message: 'ordinary secret planning text'});
   assert(Object.isFrozen(result.data));
   assert(Object.isFrozen(result.data.items));
   assert(Object.isFrozen(result.data.items[0]));
@@ -200,15 +237,29 @@ test('rejects accessor, hostile proxy, cyclic, and oversized executor output can
 });
 
 test('rejects credential-bearing executor output without rejecting ordinary message text', async () => {
+  const allowedCore = createToolCore({
+    definitions: definitionsWithOutput('pure.discovery.profile.get', MESSAGE_OUTPUT),
+    executors: {gateway: {
+      async health() { return 'online'; },
+      async execute() { return {message: 'ordinary secret planning text'}; }
+    }}
+  });
+  const allowed = await allowedCore.invoke('pure.discovery.profile.get', {userId: 'user-1'}, {
+    callerId: 'agent-1', accountId: 'account-1', scopes: ['pure:read']
+  });
+  assert.equal(allowed.ok, true);
+  assert.equal(allowed.data.message, 'ordinary secret planning text');
+
   const forbidden = [
-    {authorization: 'value'}, {cookies: 'value'}, {password: 'value'}, {clientSecret: 'value'},
-    {bearer: 'value'}, {accessToken: 'value'}, {refresh_token: 'value'},
-    {'session-token': 'value'}, {apiKey: 'value'},
-    {message: 'Bearer abc.def.ghi'}, {url: 'https://private-cdn.thepure.app/photo'}
+    {message: 'safe', token: 'skliveABC123'},
+    {message: 'safe', documentCookie: 'fixture-cookie'},
+    {message: 'safe', protectedUrl: 'https://private-cdn.thepure.app/photo'},
+    {message: 'safe', unexpected: true},
+    {message: 'Bearer abc.def.ghi'}
   ];
   for (const output of forbidden) {
     const core = createToolCore({
-      definitions: definitionsWith('pure.discovery.profile.get'),
+      definitions: definitionsWithOutput('pure.discovery.profile.get', MESSAGE_OUTPUT),
       executors: {gateway: {
         async health() { return 'online'; },
         async execute() { return output; }
@@ -224,7 +275,10 @@ test('rejects credential-bearing executor output without rejecting ordinary mess
 });
 
 test('falls back for unsafe request IDs in public results and audit', async () => {
-  for (const unsafe of [' has-space ', 'line\nbreak', 'fixture-request-id-secret', {}, Promise.resolve('late')]) {
+  for (const unsafe of [
+    ' has-space ', 'line\nbreak', 'fixture-request-id-secret', 'skliveABC123',
+    'req_skliveABC123', {}, Promise.resolve('late')
+  ]) {
     const events = [];
     const core = createToolCore({
       definitions: CORE_TOOL_DEFINITIONS,
@@ -234,7 +288,8 @@ test('falls back for unsafe request IDs in public results and audit', async () =
     const result = await core.invoke('system.capabilities.list', {}, {
       callerId: 'agent-1', accountId: 'account-1', scopes: ['pure:read']
     });
-    assert.match(result.requestId, /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/);
+    await flushAudit();
+    assert.match(result.requestId, /^req_[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     assert.notEqual(result.requestId, unsafe);
     assert.equal(events[0].requestId, result.requestId);
     assert(!JSON.stringify({result, events}).includes('fixture-request-id-secret'));
@@ -279,9 +334,13 @@ test('snapshots hostile and malformed core options without invoking getters', as
 
 test('does not wait for a never-settling audit callback', async () => {
   let settled = false;
+  let auditBegan = false;
   const core = createToolCore({
     definitions: CORE_TOOL_DEFINITIONS,
-    audit: () => new Promise(() => {})
+    audit: () => {
+      auditBegan = true;
+      return new Promise(() => {});
+    }
   });
   const invocation = core.invoke('system.capabilities.list', {}, {
     callerId: 'agent-1', accountId: 'account-1', scopes: ['pure:read']
@@ -293,6 +352,36 @@ test('does not wait for a never-settling audit callback', async () => {
   ]);
   assert.equal(settled, true);
   assert.equal(result.ok, true);
+  assert.equal(auditBegan, false);
+  await flushAudit();
+  assert.equal(auditBegan, true);
+});
+
+test('resolves invoke before a slow synchronous audit callback begins', async () => {
+  let began = false;
+  let finished = false;
+  const core = createToolCore({
+    definitions: CORE_TOOL_DEFINITIONS,
+    audit: () => {
+      began = true;
+      const until = Date.now() + 80;
+      while (Date.now() < until) {}
+      finished = true;
+      return Object.defineProperty({}, 'then', {
+        get() { throw new Error('fixture-hostile-thenable-secret'); }
+      });
+    }
+  });
+
+  const result = await core.invoke('system.capabilities.list', {}, {
+    callerId: 'agent-1', accountId: 'account-1', scopes: ['pure:read']
+  });
+  assert.equal(result.ok, true);
+  assert.equal(began, false);
+  assert.equal(finished, false);
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(began, true);
+  assert.equal(finished, true);
 });
 
 test('attributes canonical and raw executor failures to the attempted executor', async () => {
@@ -309,6 +398,7 @@ test('attributes canonical and raw executor failures to the attempted executor',
     const result = await core.invoke('pure.discovery.profile.get', {userId: 'user-1'}, {
       callerId: 'agent-1', accountId: 'account-1', scopes: ['pure:read']
     });
+    await flushAudit();
     assert.equal(result.executor, 'gateway');
     assert.equal(events[0].executor, 'gateway');
     assert(!JSON.stringify({result, events}).includes('fixture-provider-secret'));
@@ -328,6 +418,7 @@ test('attributes executor health failure to the selected executor', async () => 
   const result = await core.invoke('pure.discovery.profile.get', {userId: 'user-1'}, {
     callerId: 'agent-1', accountId: 'account-1', scopes: ['pure:read']
   });
+  await flushAudit();
   assert.equal(result.error, 'gateway_offline');
   assert.equal(result.executor, 'gateway');
   assert.equal(events[0].executor, 'gateway');

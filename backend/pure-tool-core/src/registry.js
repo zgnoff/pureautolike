@@ -7,7 +7,7 @@ const MUTATIONS = new Set(['read', 'idempotent', 'non_idempotent', 'destructive'
 const SCOPE = /^[a-z][a-z0-9]*(?::[a-z][a-z0-9_]*)+$/;
 const FIELDS = [
   'name', 'schemaVersion', 'description', 'executors', 'scopes',
-  'confirmation', 'mutation', 'safeFailover', 'implemented', 'inputSchema'
+  'confirmation', 'mutation', 'safeFailover', 'implemented', 'inputSchema', 'outputSchema'
 ];
 const MAX_SNAPSHOT_DEPTH = 32;
 const MAX_SNAPSHOT_NODES = 2_000;
@@ -78,17 +78,72 @@ function snapshotJson(value, state, depth = 0) {
   return Object.freeze(result);
 }
 
-function snapshotSchema(value) {
-  const schema = snapshotJson(value, {visiting: new WeakSet(), nodes: 0});
-  if (!schema || Array.isArray(schema) || schema.type !== 'object') reject();
-  if (schema.additionalProperties !== false) reject();
-  if (!schema.properties || Array.isArray(schema.properties) || typeof schema.properties !== 'object') reject();
-  if (Object.hasOwn(schema, 'required')) {
-    if (!Array.isArray(schema.required)) reject();
-    if (!schema.required.every(key => typeof key === 'string' && key.length > 0)) reject();
-    if (new Set(schema.required).size !== schema.required.length) reject();
-    if (!schema.required.every(key => Object.hasOwn(schema.properties, key))) reject();
+function validateSchema(schema, depth = 0) {
+  if (!schema || Array.isArray(schema) || typeof schema !== 'object' || depth > MAX_SNAPSHOT_DEPTH) reject();
+  const type = schema.type;
+  const common = new Set(['type', 'enum']);
+  if (!['string', 'boolean', 'number', 'integer', 'array', 'object'].includes(type)) reject();
+  if (Object.hasOwn(schema, 'enum')) {
+    if (type === 'array' || type === 'object') reject();
+    if (!Array.isArray(schema.enum) || schema.enum.length === 0) reject();
+    for (const item of schema.enum) {
+      if (type === 'string' && typeof item !== 'string') reject();
+      if (type === 'boolean' && typeof item !== 'boolean') reject();
+      if ((type === 'number' || type === 'integer') &&
+          (typeof item !== 'number' || !Number.isFinite(item) || (type === 'integer' && !Number.isInteger(item)))) {
+        reject();
+      }
+    }
   }
+  if (type === 'string') {
+    common.add('minLength');
+    common.add('maxLength');
+    for (const key of ['minLength', 'maxLength']) {
+      if (Object.hasOwn(schema, key) && (!Number.isSafeInteger(schema[key]) || schema[key] < 0)) reject();
+    }
+    if (schema.minLength > schema.maxLength) reject();
+  } else if (type === 'number' || type === 'integer') {
+    common.add('minimum');
+    common.add('maximum');
+    for (const key of ['minimum', 'maximum']) {
+      if (Object.hasOwn(schema, key) && (typeof schema[key] !== 'number' || !Number.isFinite(schema[key]))) reject();
+    }
+    if (schema.minimum > schema.maximum) reject();
+  } else if (type === 'array') {
+    common.add('items');
+    common.add('minItems');
+    common.add('maxItems');
+    if (!Object.hasOwn(schema, 'items')) reject();
+    for (const key of ['minItems', 'maxItems']) {
+      if (Object.hasOwn(schema, key) && (!Number.isSafeInteger(schema[key]) || schema[key] < 0 || schema[key] > 100)) {
+        reject();
+      }
+    }
+    if (schema.minItems > schema.maxItems) reject();
+    validateSchema(schema.items, depth + 1);
+  } else if (type === 'object') {
+    common.add('properties');
+    common.add('required');
+    common.add('additionalProperties');
+    if (schema.additionalProperties !== false || !schema.properties ||
+        Array.isArray(schema.properties) || typeof schema.properties !== 'object') reject();
+    const propertyNames = Object.keys(schema.properties);
+    if (propertyNames.length > 100) reject();
+    for (const property of propertyNames) validateSchema(schema.properties[property], depth + 1);
+    if (Object.hasOwn(schema, 'required')) {
+      if (!Array.isArray(schema.required) ||
+          !schema.required.every(key => typeof key === 'string' && key.length > 0) ||
+          new Set(schema.required).size !== schema.required.length ||
+          !schema.required.every(key => Object.hasOwn(schema.properties, key))) reject();
+    }
+  }
+  if (Object.keys(schema).some(key => !common.has(key))) reject();
+}
+
+function snapshotSchema(value, rootType) {
+  const schema = snapshotJson(value, {visiting: new WeakSet(), nodes: 0});
+  validateSchema(schema);
+  if (rootType && schema.type !== rootType) reject();
   return schema;
 }
 
@@ -115,7 +170,8 @@ function snapshotDefinition(definition) {
     mutation: values.mutation,
     safeFailover: values.safeFailover,
     implemented: values.implemented,
-    inputSchema: snapshotSchema(values.inputSchema)
+    inputSchema: snapshotSchema(values.inputSchema, 'object'),
+    outputSchema: snapshotSchema(values.outputSchema)
   });
 }
 

@@ -5,7 +5,7 @@ import {failure, success} from './results.js';
 import {createRouter} from './router.js';
 import {normalizeArgs} from './schema.js';
 
-const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const REQUEST_ID = /^req_[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const MAX_OUTPUT_DEPTH = 8;
 const MAX_OUTPUT_KEYS = 100;
@@ -35,14 +35,17 @@ function optionSnapshot(options) {
 function credentialKey(key) {
   const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
   return normalized === 'authorization' || normalized === 'cookie' || normalized === 'cookies' ||
-    normalized === 'setcookie' || normalized.includes('password') || normalized.includes('secret') ||
+    normalized === 'setcookie' || normalized === 'documentcookie' || normalized === 'token' ||
+    normalized === 'credential' || normalized === 'credentials' || normalized.includes('password') ||
+    normalized.includes('secret') ||
     normalized.includes('bearer') || normalized.includes('accesstoken') ||
     normalized.includes('refreshtoken') || normalized.includes('sessiontoken') ||
-    normalized.includes('apikey');
+    normalized.includes('apikey') || normalized.includes('protectedurl') ||
+    normalized.includes('privateurl') || normalized.includes('signedurl');
 }
 
 function unsafeString(value) {
-  return BEARER_CREDENTIAL.test(value) || PRIVATE_CDN.test(value);
+  return BEARER_CREDENTIAL.test(value) || PRIVATE_CDN.test(value) || /\bsk_?live[A-Za-z0-9_-]+/i.test(value);
 }
 
 function rejectOutput(code = 'executor_rejected') {
@@ -123,6 +126,15 @@ function snapshotOutput(value) {
   }
 }
 
+function normalizeOutput(value, schema) {
+  const snapshot = snapshotOutput(value);
+  try {
+    return normalizeArgs(snapshot, schema);
+  } catch {
+    throw toolError('executor_rejected');
+  }
+}
+
 function safeCallerType(context) {
   try {
     if (!context || (typeof context !== 'object' && typeof context !== 'function')) return 'system';
@@ -173,13 +185,13 @@ export function createToolCore(options = {}) {
       await authorize(definition, args, context, confirmationVerifier);
       if (!definition.implemented) throw toolError('capability_not_implemented');
       if (definition.name === 'system.capabilities.list') {
-        result = success(snapshotOutput(await capabilities()), {
+        result = success(normalizeOutput(await capabilities(), definition.outputSchema), {
           executor, requestId: id, capabilityVersion: definition.schemaVersion
         });
       } else {
         const routed = await router.execute(definition, args, context, attempted => { executor = attempted; });
         executor = routed.executor;
-        result = success(snapshotOutput(routed.data), {
+        result = success(normalizeOutput(routed.data, definition.outputSchema), {
           executor, requestId: id, capabilityVersion: definition.schemaVersion
         });
       }
@@ -198,7 +210,11 @@ export function createToolCore(options = {}) {
       confirmation: definition?.confirmation || 'none'
     });
     try {
-      Promise.resolve(Reflect.apply(audit, undefined, [event])).catch(() => {});
+      setTimeout(() => {
+        try {
+          Promise.resolve(Reflect.apply(audit, undefined, [event])).catch(() => {});
+        } catch {}
+      }, 0);
     } catch {}
     return result;
   }
