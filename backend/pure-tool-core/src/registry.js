@@ -139,7 +139,7 @@ function buildRegistry(definitions) {
           const descriptor = healthDescriptors[executor];
           return Boolean(descriptor && Object.hasOwn(descriptor, 'value') && descriptor.value === 'online');
         };
-        return list.map(definition => {
+        return Object.freeze(list.map(definition => {
           let availability = 'available';
           if (!definition.implemented) availability = 'not_implemented';
           else if (!definition.executors.includes('core') && !definition.executors.some(isOnline)) {
@@ -153,7 +153,7 @@ function buildRegistry(definitions) {
             confirmation: definition.confirmation,
             availability
           });
-        });
+        }));
       } catch {
         reject();
       }

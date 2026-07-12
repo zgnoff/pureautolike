@@ -123,6 +123,7 @@ test('marks unavailable catalog operations honestly', () => {
   const autolike = capabilities.find(item => item.name === 'extension.autolike.start');
   assert.equal(photoList.availability, 'not_implemented');
   assert.equal(autolike.availability, 'not_implemented');
+  assert.equal(Object.isFrozen(capabilities), true);
 });
 
 test('rejects duplicate, malformed, and unsafe definitions', () => {

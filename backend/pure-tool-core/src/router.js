@@ -101,6 +101,15 @@ function canonicalExecutorError(error) {
   }
 }
 
+function notifyAttempt(observer, name) {
+  if (typeof observer !== 'function') return;
+  try {
+    Reflect.apply(observer, undefined, [name]);
+  } catch {
+    // Attempt reporting is private metadata and must not affect routing.
+  }
+}
+
 export function createRouter(options = {}) {
   const available = snapshotExecutors(options);
 
@@ -133,13 +142,14 @@ export function createRouter(options = {}) {
 
   return Object.freeze({
     health,
-    async execute(definition, args, context = {}) {
+    async execute(definition, args, context = {}, attemptObserver) {
       const preferred = snapshotPreferredExecutor(context);
       const {states, ordered} = await candidates(definition, preferred);
       let primaryFailure = null;
 
       for (let index = 0; index < ordered.length; index += 1) {
         const name = ordered[index];
+        notifyAttempt(attemptObserver, name);
         const state = states[name];
         if (state !== 'online') {
           const failure = state === 'reauth_required' || state === 'compatibility_required'

@@ -264,3 +264,15 @@ test('preserves a meaningful canonical secondary runtime failure', async () => {
   assert.notEqual(caught, secondaryOwned);
   assert.equal(Object.hasOwn(caught, 'secret'), false);
 });
+
+test('reports each attempted executor through an optional internal observer', async () => {
+  const attempts = [];
+  const router = createRouter({executors: {
+    gateway: executor('gateway', 'online', async () => { throw toolError('gateway_offline'); }),
+    extension: executor('extension', 'online', async () => 'ok')
+  }});
+  const definition = {...registry.get('pure.chats.list'), implemented: true, executors: ['gateway', 'extension']};
+  const result = await router.execute(definition, {}, {}, name => attempts.push(name));
+  assert.equal(result.executor, 'extension');
+  assert.deepEqual(attempts, ['gateway', 'extension']);
+});
