@@ -85,6 +85,7 @@ const sessions = assertColumns('bridge_cloud_sessions', [
   'account_id',
   'active_device_id',
   'envelope_version',
+  'envelope_created_at',
   'envelope_ciphertext',
   'gateway_key_id',
   'credential_fingerprint_hash',
@@ -95,6 +96,7 @@ const sessions = assertColumns('bridge_cloud_sessions', [
   'revoked_at'
 ]);
 assert(sessions.includes('REFERENCES bridge_accounts(id)'), 'cloud session account foreign key missing');
+assert(sessions.includes('UNIQUE (account_id)'), 'cloud sessions must allow only one row per account');
 assert(sessions.includes('FOREIGN KEY (account_id, active_device_id) REFERENCES bridge_devices(account_id, id)'), 'cloud session device must belong to its account');
 
 const consents = assertColumns('bridge_cloud_consents', [
@@ -219,9 +221,17 @@ for (const forbidden of ['ciphertext', 'payload', 'body', 'url', 'path', 'conten
 
 assertSqlRejected(`
 INSERT INTO bridge_cloud_sessions
-  (id, account_id, active_device_id, envelope_version, envelope_ciphertext, gateway_key_id, credential_fingerprint_hash)
-VALUES ('session-cross-account', 'account-a', 'device-b', 1, 'ciphertext', 'key-1', 'fingerprint');
+  (id, account_id, active_device_id, envelope_version, envelope_created_at, envelope_ciphertext, gateway_key_id, credential_fingerprint_hash)
+VALUES ('session-cross-account', 'account-a', 'device-b', 1, 1783857600000, 'ciphertext', 'key-1', 'fingerprint');
 `, 'cloud sessions must reject a device owned by another account');
+
+assertSqlRejected(`
+INSERT INTO bridge_cloud_sessions
+  (id, account_id, active_device_id, envelope_version, envelope_created_at, envelope_ciphertext, gateway_key_id, credential_fingerprint_hash)
+VALUES
+  ('session-account-first', 'account-a', 'device-a', 1, 1783857600000, 'ciphertext-1', 'key-1', 'fingerprint-1'),
+  ('session-account-second', 'account-a', 'device-a', 1, 1783857600001, 'ciphertext-2', 'key-1', 'fingerprint-2');
+`, 'cloud sessions must reject multiple rows for one account');
 
 assertSqlRejected(`
 INSERT INTO bridge_gateway_leases
@@ -265,8 +275,8 @@ VALUES ${validQueueValues};
 
 assertSqlAccepted(`
 INSERT INTO bridge_cloud_sessions
-  (id, account_id, active_device_id, envelope_version, envelope_ciphertext, gateway_key_id, credential_fingerprint_hash)
-VALUES ('session-valid', 'account-a', 'device-a', 1, 'ciphertext', 'key-1', 'fingerprint');
+  (id, account_id, active_device_id, envelope_version, envelope_created_at, envelope_ciphertext, gateway_key_id, credential_fingerprint_hash)
+VALUES ('session-valid', 'account-a', 'device-a', 1, 1783857600000, 'ciphertext', 'key-1', 'fingerprint');
 INSERT INTO bridge_gateway_leases
   (id, account_id, device_id, gateway_id, lease_token_hash, expires_at)
 VALUES ('lease-valid', 'account-a', 'device-a', 'gateway-1', 'lease-hash-valid', '2026-07-12T12:01:00Z');
@@ -293,6 +303,8 @@ let accountStatus = 'active';
 let deviceStatus = 'active';
 let consentWarningVersion = '';
 let storedCloudSession = null;
+let forceAtomicZeroChanges = false;
+let deleteAfterAtomicUpsert = false;
 cloudDb.when('FROM bridge_sessions s', () => ({
   account_id: 'account-cloud-1',
   device_id: 'device-cloud-1',
@@ -310,35 +322,43 @@ cloudDb.when('INSERT INTO bridge_cloud_consents', ({params}) => {
   return {success: true, meta: {changes: 1}};
 });
 cloudDb.when('FROM bridge_cloud_sessions', () => storedCloudSession);
-cloudDb.when('INSERT INTO bridge_cloud_sessions', ({params}) => {
-  storedCloudSession = {
-    id: params[0],
-    active_device_id: params[2],
-    envelope_version: params[3],
-    envelope_ciphertext: params[4],
-    gateway_key_id: params[5],
-    credential_fingerprint_hash: params[6],
-    status: 'pending',
-    created_at: '2026-07-12T12:00:00.000Z',
-    rotated_at: null,
-    last_used_at: null
-  };
-  return {success: true, meta: {changes: 1}};
-});
-cloudDb.when('UPDATE bridge_cloud_sessions', ({params}) => {
-  if (storedCloudSession) {
+cloudDb.when('INSERT INTO bridge_cloud_sessions', ({sql, params}) => {
+  if (forceAtomicZeroChanges) return {success: true, meta: {changes: 0}};
+  const isRotation = !!storedCloudSession;
+  if (!storedCloudSession) {
+    storedCloudSession = {
+      id: params[0],
+      active_device_id: params[2],
+      envelope_version: params[3],
+      envelope_created_at: params[4],
+      envelope_ciphertext: params[5],
+      gateway_key_id: params[6],
+      credential_fingerprint_hash: params[7],
+      status: 'pending',
+      created_at: '2026-07-12T12:00:00.000Z',
+      rotated_at: null,
+      last_used_at: null
+    };
+  } else if (params[4] > storedCloudSession.envelope_created_at) {
     storedCloudSession = {
       ...storedCloudSession,
-      active_device_id: params[0],
-      envelope_version: params[1],
-      envelope_ciphertext: params[2],
-      gateway_key_id: params[3],
-      credential_fingerprint_hash: params[4],
+      active_device_id: params[2],
+      envelope_version: params[3],
+      envelope_created_at: params[4],
+      envelope_ciphertext: params[5],
+      gateway_key_id: params[6],
+      credential_fingerprint_hash: params[7],
       status: 'pending',
       rotated_at: '2026-07-12T12:00:00.000Z',
       last_used_at: null
     };
+  } else {
+    return {success: true, meta: {changes: 0}};
   }
+  assert(sql.includes('ON CONFLICT(account_id) DO UPDATE'), 'cloud upload must use an atomic account upsert');
+  assert(sql.includes('excluded.envelope_created_at > bridge_cloud_sessions.envelope_created_at'), 'atomic rotation must reject equal or older envelopes');
+  assert(isRotation === !!storedCloudSession.rotated_at, 'fake D1 rotation state must match the upsert path');
+  if (deleteAfterAtomicUpsert) storedCloudSession = null;
   return {success: true, meta: {changes: 1}};
 });
 cloudDb.when('DELETE FROM bridge_cloud_sessions', () => {
@@ -421,6 +441,11 @@ const wrongWarningResponse = await callCloud('/v1/cloud/consent', {
   body: {warning_version: 'cloud-risk-old'}
 });
 assert(wrongWarningResponse.status === 400 && (await wrongWarningResponse.json()).code === 'CONSENT_REQUIRED', 'consent must require the configured warning version');
+const malformedConsentResponse = await callCloud('/v1/cloud/consent', {
+  method: 'POST',
+  body: '{not-json'
+});
+assert(malformedConsentResponse.status === 400 && (await malformedConsentResponse.json()).code === 'INVALID_ENVELOPE', 'malformed cloud consent JSON must use INVALID_ENVELOPE');
 const consentResponse = await callCloud('/v1/cloud/consent', {
   method: 'POST',
   body: {warning_version: 'cloud-risk-v1'}
@@ -460,6 +485,54 @@ const oversizedBodyResponse = await callCloud('/v1/cloud/session', {
 });
 assert(oversizedBodyResponse.status === 413 && (await oversizedBodyResponse.json()).code === 'INVALID_ENVELOPE', 'cloud request body over 64 KiB must use INVALID_ENVELOPE');
 
+for (const body of ['', '{not-json']) {
+  const response = await callCloud('/v1/cloud/session', {method: 'PUT', body});
+  assert(response.status === 400 && (await response.json()).code === 'INVALID_ENVELOPE', 'empty or malformed JSON must return 400 INVALID_ENVELOPE');
+}
+
+const contentLengthResponse = await cloudBridge.handle(new Request('https://worker.example/v1/cloud/session', {
+  method: 'PUT',
+  headers: {
+    Authorization: `Bearer ${cloudToken}`,
+    'Content-Type': 'application/json',
+    'Content-Length': String(65537)
+  },
+  body: '{}'
+}), cloudEnv());
+assert(contentLengthResponse.status === 413, 'declared cloud body over 64 KiB must be rejected before parsing');
+
+let streamedBodyCanceled = false;
+let streamedBodyPulls = 0;
+const oversizedStream = new ReadableStream({
+  pull(controller) {
+    streamedBodyPulls += 1;
+    controller.enqueue(new Uint8Array(40000));
+  },
+  cancel() {
+    streamedBodyCanceled = true;
+  }
+});
+const streamedOversizeResponse = await cloudBridge.handle(new Request('https://worker.example/v1/cloud/session', {
+  method: 'PUT',
+  headers: {
+    Authorization: `Bearer ${cloudToken}`,
+    'Content-Type': 'application/json'
+  },
+  body: oversizedStream,
+  duplex: 'half'
+}), cloudEnv());
+assert(streamedOversizeResponse.status === 413, 'chunked cloud body over 64 KiB must return 413');
+assert(streamedBodyCanceled, 'oversized chunked body reader must be canceled immediately');
+assert(streamedBodyPulls <= 3, 'oversized chunked body must stop reading after crossing the limit');
+
+for (const createdAt of [cloudNow.getTime() - 30001, cloudNow.getTime() + 30001]) {
+  const response = await callCloud('/v1/cloud/session', {
+    method: 'PUT',
+    body: {envelope: validEnvelope({createdAt}), credential_fingerprint_hash: 'fingerprint-hash-1'}
+  });
+  assert(response.status === 400 && (await response.json()).code === 'INVALID_ENVELOPE', 'stale or future activation envelope must use INVALID_ENVELOPE');
+}
+
 const createdResponse = await callCloud('/v1/cloud/session', {
   method: 'PUT',
   body: {envelope: validEnvelope(), credential_fingerprint_hash: 'fingerprint-hash-1'}
@@ -469,14 +542,42 @@ const created = await createdResponse.json();
 assert(created.status === 'pending' && !JSON.stringify(created).includes('C'.repeat(32)), 'upload response must be redacted');
 const originalSessionId = storedCloudSession.id;
 
+for (const createdAt of [cloudNow.getTime(), cloudNow.getTime() - 1]) {
+  const response = await callCloud('/v1/cloud/session', {
+    method: 'PUT',
+    body: {envelope: validEnvelope({createdAt, ciphertext: 'R'.repeat(64)}), credential_fingerprint_hash: 'fingerprint-replay'}
+  });
+  assert(response.status === 400 && (await response.json()).code === 'INVALID_ENVELOPE', 'equal or rollback rotation must use INVALID_ENVELOPE');
+  assert(storedCloudSession.credential_fingerprint_hash === 'fingerprint-hash-1', 'replayed rotation must not replace stored session metadata');
+}
+
+forceAtomicZeroChanges = true;
+const zeroChangeResponse = await callCloud('/v1/cloud/session', {
+  method: 'PUT',
+  body: {envelope: validEnvelope({createdAt: cloudNow.getTime() + 1}), credential_fingerprint_hash: 'fingerprint-race'}
+});
+forceAtomicZeroChanges = false;
+assert(zeroChangeResponse.status === 400 && (await zeroChangeResponse.json()).code === 'INVALID_ENVELOPE', 'zero-change atomic upsert must not return false success');
+
+const beforeConcurrentDelete = storedCloudSession;
+deleteAfterAtomicUpsert = true;
+const concurrentDeleteResponse = await callCloud('/v1/cloud/session', {
+  method: 'PUT',
+  body: {envelope: validEnvelope({createdAt: cloudNow.getTime() + 1}), credential_fingerprint_hash: 'fingerprint-deleted'}
+});
+deleteAfterAtomicUpsert = false;
+assert(concurrentDeleteResponse.status === 400 && (await concurrentDeleteResponse.json()).code === 'INVALID_ENVELOPE', 'concurrent deletion after atomic upsert must not return false success');
+storedCloudSession = beforeConcurrentDelete;
+
 const rotatedResponse = await callCloud('/v1/cloud/session', {
   method: 'PUT',
-  body: {envelope: validEnvelope({ciphertext: 'D'.repeat(64)}), credential_fingerprint_hash: 'fingerprint-hash-2'}
+  body: {envelope: validEnvelope({createdAt: cloudNow.getTime() + 2, ciphertext: 'D'.repeat(64)}), credential_fingerprint_hash: 'fingerprint-hash-2'}
 });
 assert(rotatedResponse.status === 200, 'rotating a cloud session must return 200');
 assert(storedCloudSession.id === originalSessionId, 'rotation must preserve the cloud session identity');
 assert(storedCloudSession.envelope_ciphertext.includes('D'.repeat(32)), 'rotation must replace the stored envelope');
-assert(cloudDb.calls.some(call => call.sql.includes('UPDATE bridge_cloud_sessions') && call.sql.includes('rotated_at = CURRENT_TIMESTAMP')), 'rotation must record rotated_at');
+assert(cloudDb.calls.some(call => call.sql.includes('INSERT INTO bridge_cloud_sessions') && call.sql.includes('rotated_at = CURRENT_TIMESTAMP')), 'atomic rotation must record rotated_at');
+assert(!cloudDb.calls.some(call => /^\s*UPDATE bridge_cloud_sessions/.test(call.sql)), 'cloud rotation must not use a separate UPDATE statement');
 
 const statusResponse = await callCloud('/v1/cloud/status');
 const status = await statusResponse.json();
