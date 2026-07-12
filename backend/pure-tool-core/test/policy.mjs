@@ -5,6 +5,20 @@ import {authorize, confirmationBinding, createRegistry, CORE_TOOL_DEFINITIONS} f
 
 const registry = createRegistry(CORE_TOOL_DEFINITIONS);
 const context = {callerId: 'agent-1', accountId: 'account-1', scopes: ['pure:read']};
+const EXPECTED_BINDING = '["object",[[["string","accountId"],["string","account-1"]],[["string","args"],["object",[[["string","matchId"],["string","match-1"]]]]],[['
+  + '"string","callerId"],["string","agent-1"]],[["string","operation"],["string","pure.matches.block"]],[["string","schemaVersion"],["string","1"]]]]';
+
+async function rejectsWithoutLeak(promise, code, secrets = []) {
+  await assert.rejects(promise, error => {
+    assert.equal(error.code, code);
+    assert.equal('cause' in error, false);
+    for (const secret of secrets) {
+      assert.equal(String(error).includes(secret), false);
+      assert.equal(JSON.stringify(error).includes(secret), false);
+    }
+    return true;
+  });
+}
 
 test('allows authorized reads without confirmation', async () => {
   const definition = registry.get('pure.chats.list');
@@ -16,26 +30,52 @@ test('denies missing scopes before executor selection', async () => {
   await assert.rejects(authorize(definition, {userId: 'user-1'}, context), {code: 'permission_denied'});
 });
 
-test('binds dangerous confirmation to exact caller, account, operation, and arguments', async () => {
+test('emits a literal canonical binding independent of object insertion order', () => {
+  assert.equal(confirmationBinding({
+    callerId: 'agent-1', accountId: 'account-1',
+    operation: 'pure.matches.block', schemaVersion: '1', args: {matchId: 'match-1'}
+  }), EXPECTED_BINDING);
+  assert.equal(confirmationBinding({
+    args: {matchId: 'match-1'}, schemaVersion: '1',
+    operation: 'pure.matches.block', accountId: 'account-1', callerId: 'agent-1'
+  }), EXPECTED_BINDING);
+});
+
+test('binds dangerous confirmation to exact caller, account, operation, schema, and arguments', async () => {
   const definition = registry.get('pure.matches.block');
   const privileged = {
     callerId: 'agent-1', accountId: 'account-1',
     scopes: ['pure:account:dangerous'], confirmationToken: 'confirm-1'
   };
-  let observed;
-  await authorize(definition, {matchId: 'match-1'}, privileged, async input => {
-    observed = input;
-    return true;
-  });
-  assert.equal(observed.token, 'confirm-1');
-  assert.equal(observed.binding, confirmationBinding({
-    callerId: 'agent-1', accountId: 'account-1',
-    operation: 'pure.matches.block', schemaVersion: '1', args: {matchId: 'match-1'}
-  }));
+  const verifier = async ({token, binding}) => token === 'confirm-1' && binding === EXPECTED_BINDING;
+  await assert.doesNotReject(authorize(definition, {matchId: 'match-1'}, privileged, verifier));
+
+  const variants = [
+    {...privileged, callerId: 'agent-2'},
+    {...privileged, accountId: 'account-2'}
+  ];
+  for (const variant of variants) {
+    await assert.rejects(authorize(definition, {matchId: 'match-1'}, variant, verifier), {
+      code: 'confirmation_required'
+    });
+  }
   await assert.rejects(
-    authorize(definition, {matchId: 'match-2'}, privileged, async () => false),
+    authorize(registry.get('pure.matches.report'), {matchId: 'match-1'}, privileged, verifier),
     {code: 'confirmation_required'}
   );
+  await assert.rejects(authorize(definition, {matchId: 'match-2'}, privileged, verifier), {
+    code: 'confirmation_required'
+  });
+
+  const base = {
+    callerId: 'agent-1', accountId: 'account-1',
+    operation: 'pure.matches.block', schemaVersion: '1', args: {matchId: 'match-1'}
+  };
+  assert.notEqual(confirmationBinding({...base, callerId: 'agent-2'}), EXPECTED_BINDING);
+  assert.notEqual(confirmationBinding({...base, accountId: 'account-2'}), EXPECTED_BINDING);
+  assert.notEqual(confirmationBinding({...base, operation: 'pure.matches.report'}), EXPECTED_BINDING);
+  assert.notEqual(confirmationBinding({...base, schemaVersion: '2'}), EXPECTED_BINDING);
+  assert.notEqual(confirmationBinding({...base, args: {matchId: 'match-2'}}), EXPECTED_BINDING);
 });
 
 test('rejects malformed caller context without leaking supplied values', async () => {
@@ -45,4 +85,103 @@ test('rejects malformed caller context without leaking supplied values', async (
     assert.equal(error.code, 'permission_denied');
     return !String(error).includes(secret);
   });
+});
+
+test('sanitizes null, accessor, proxy, inherited, and hostile-scope contexts', async () => {
+  const definition = registry.get('pure.chats.list');
+  const secret = 'fixture-hostile-context-secret';
+  let callerGetterCalled = false;
+  const accessorContext = {accountId: 'account-1', scopes: ['pure:read']};
+  Object.defineProperty(accessorContext, 'callerId', {
+    enumerable: true,
+    get() {
+      callerGetterCalled = true;
+      throw new Error(secret);
+    }
+  });
+  const proxyContext = new Proxy({}, {ownKeys() { throw new Error(secret); }});
+  const transparentProxyContext = new Proxy({...context}, {});
+  const inheritedContext = Object.create(context);
+
+  let scopeGetterCalled = false;
+  const accessorScopes = [];
+  Object.defineProperty(accessorScopes, '0', {
+    enumerable: true,
+    get() {
+      scopeGetterCalled = true;
+      throw new Error(secret);
+    }
+  });
+  const customScopes = ['pure:read'];
+  Object.defineProperty(customScopes, Symbol.iterator, {
+    get() {
+      throw new Error(secret);
+    }
+  });
+  const sparseScopes = new Array(1);
+  const proxyScopes = new Proxy(['pure:read'], {ownKeys() { throw new Error(secret); }});
+  const transparentProxyScopes = new Proxy(['pure:read'], {});
+
+  const hostile = [
+    null,
+    accessorContext,
+    proxyContext,
+    transparentProxyContext,
+    inheritedContext,
+    {...context, scopes: accessorScopes},
+    {...context, scopes: customScopes},
+    {...context, scopes: sparseScopes},
+    {...context, scopes: proxyScopes},
+    {...context, scopes: transparentProxyScopes}
+  ];
+  for (const value of hostile) {
+    await rejectsWithoutLeak(authorize(definition, {}, value), 'permission_denied', [secret]);
+  }
+  assert.equal(callerGetterCalled, false);
+  assert.equal(scopeGetterCalled, false);
+});
+
+test('maps malformed dangerous tokens and verifier failures to fresh confirmation errors', async () => {
+  const definition = registry.get('pure.matches.block');
+  const rawSecret = 'fixture-verifier-raw-secret';
+  const tokenSecret = 'fixture-confirmation-token-secret';
+  const privileged = {
+    callerId: 'agent-1', accountId: 'account-1',
+    scopes: ['pure:account:dangerous'], confirmationToken: tokenSecret
+  };
+  await rejectsWithoutLeak(
+    authorize(definition, {matchId: 'match-1'}, privileged, async () => { throw new Error(rawSecret); }),
+    'confirmation_required',
+    [rawSecret, tokenSecret]
+  );
+  await rejectsWithoutLeak(
+    authorize(definition, {matchId: 'match-1'}, privileged, async () => ({valid: true})),
+    'confirmation_required',
+    [tokenSecret]
+  );
+
+  let tokenGetterCalled = false;
+  const accessorToken = {...privileged};
+  Object.defineProperty(accessorToken, 'confirmationToken', {
+    enumerable: true,
+    get() {
+      tokenGetterCalled = true;
+      throw new Error(rawSecret);
+    }
+  });
+  await rejectsWithoutLeak(
+    authorize(definition, {matchId: 'match-1'}, accessorToken, async () => true),
+    'confirmation_required',
+    [rawSecret]
+  );
+  assert.equal(tokenGetterCalled, false);
+});
+
+test('distinguishes positive and negative zero in confirmation bindings', () => {
+  const input = {
+    callerId: 'agent-1', accountId: 'account-1',
+    operation: 'pure.matches.block', schemaVersion: '1'
+  };
+  assert.notEqual(confirmationBinding({...input, args: {value: 0}}),
+    confirmationBinding({...input, args: {value: -0}}));
 });
