@@ -13,6 +13,14 @@ test('publishes the stable foundation error codes', () => {
   assert(ERROR_CODES.has('operation_uncertain'));
 });
 
+test('prevents consumers from mutating the published error codes', () => {
+  assert([...ERROR_CODES].includes('invalid_input'));
+  assert.throws(() => ERROR_CODES.add('made_up_error'), {name: 'TypeError'});
+  assert.throws(() => ERROR_CODES.delete('invalid_input'), {name: 'TypeError'});
+  assert.throws(() => ERROR_CODES.clear(), {name: 'TypeError'});
+  assert.throws(() => toolError('made_up_error'), {name: 'TypeError'});
+});
+
 test('creates frozen success results with stable metadata', () => {
   const result = success({state: 'active'}, {
     executor: 'gateway', requestId: 'req-1', capabilityVersion: '1'
@@ -36,6 +44,16 @@ test('does not echo provider text through external failures', () => {
   assert.equal(result.retryable, false);
   assert(!JSON.stringify(result).includes(secret));
   assert(!String(error).includes(secret));
+});
+
+test('does not retain provider errors on public error properties', () => {
+  const secret = 'fixture-provider-cause-must-not-be-reachable';
+  const error = toolError('provider_rejected', {cause: new Error(secret)});
+  assert.equal(Object.hasOwn(error, 'cause'), false);
+  for (const key of Reflect.ownKeys(error)) {
+    assert(!String(error[key]).includes(secret));
+  }
+  assert(!JSON.stringify(error).includes(secret));
 });
 
 test('rejects unknown error codes', () => {
