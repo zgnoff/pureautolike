@@ -159,6 +159,36 @@ assert.ok(Buffer.byteLength(`${JSON.stringify(sizeBoundedFixture)}\n`, 'utf8') <
 assert.equal(sizeBoundedFixture.truncated, true);
 assert.doesNotThrow(() => assertFixtureSafe(sizeBoundedFixture));
 
+const nestedWideSummary = {
+  type: 'object',
+  keys: Array.from({length: 35}, (_, branch) => `branch${branch}`),
+  fields: Object.fromEntries(Array.from({length: 35}, (_, branch) => [
+    `branch${branch}`,
+    {
+      type: 'object',
+      keys: Array.from({length: 35}, (_, leaf) => `leaf${leaf}`),
+      fields: Object.fromEntries(Array.from({length: 35}, (_, leaf) => [`leaf${leaf}`, {type: 'string'}]))
+    }
+  ]))
+};
+const individuallyOversizedEvent = {
+  kind: 'http',
+  method: 'POST',
+  host: 'api.pure.app',
+  path: '/v2/messages/100000',
+  requestPayload: nestedWideSummary,
+  responseSummary: nestedWideSummary,
+  status: 200
+};
+let oversizedSingleFixture;
+assert.doesNotThrow(() => {
+  oversizedSingleFixture = buildSafeProtocolFixture([individuallyOversizedEvent]);
+});
+assert.deepEqual(oversizedSingleFixture.events, []);
+assert.equal(oversizedSingleFixture.truncated, true);
+assert.ok(Buffer.byteLength(`${JSON.stringify(oversizedSingleFixture)}\n`, 'utf8') <= PROTOCOL_FIXTURE_MAX_BYTES);
+assert.doesNotThrow(() => assertFixtureSafe(oversizedSingleFixture));
+
 assert.throws(
   () => sanitizeProtocolEvent({method: 'GET', url: 'https://example.com/api/feed'}),
   /host/i

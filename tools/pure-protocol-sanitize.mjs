@@ -53,7 +53,13 @@ export function buildSafeProtocolFixture(rawEvents) {
       fixture.truncated = true;
       break;
     }
-    const event = sanitizeProtocolEvent(source[index]);
+    let event;
+    try {
+      event = sanitizeProtocolEvent(source[index]);
+    } catch (_) {
+      fixture.truncated = true;
+      continue;
+    }
     const candidate = {
       ...fixture,
       events: [...fixture.events, event],
