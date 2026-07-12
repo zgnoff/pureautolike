@@ -10,7 +10,7 @@
     "build:safari": "node tools/build.mjs safari",
     "package": "node tools/package.mjs all",
     "listen:pure": "node tools/pure-api-listener.mjs",
-    "validate": "node tests/validate-extension.mjs && node tests/engagement-fixtures.mjs && node tests/background-fixtures.mjs && node tests/photo-opener-fixtures.mjs",
+    "validate": "node --test backend/pure-tool-core/test/*.mjs && node tests/validate-extension.mjs && node tests/engagement-fixtures.mjs && node tests/background-fixtures.mjs && node tests/photo-opener-fixtures.mjs",
     "audit:clean": "node tests/audit-clean.mjs"
   }
 }

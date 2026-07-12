@@ -26,3 +26,15 @@ PureAutoLike is a browser extension with three runtime layers:
   id and the bridge derives metadata from that page DOM node; content does not
   send raw photo metadata and must not receive the raw bearer token.
 - Telegram credentials live in extension local storage and are sent only from `background.js` to Telegram Bot API.
+
+## Pure Tool Core Boundary
+
+`backend/pure-tool-core` defines canonical operations, schemas, permissions,
+confirmation requirements, capability availability, result contracts, and executor
+routing shared by MCP, the application, Telegram workflows, and the cloud gateway.
+
+The core contains no Pure endpoint paths, bearer tokens, cookies, protected media
+URLs, browser APIs, Telegram credentials, or MCP transport code. Pure protocol
+knowledge belongs in fixture-backed gateway or extension executors. Operations
+without a captured and sanitized protocol remain registered as
+`capability_not_implemented`.
