@@ -9,6 +9,32 @@ const gatewayKeys = await crypto.subtle.generateKey(
   ['deriveBits']
 );
 const gatewayPublicKey = await crypto.subtle.exportKey('jwk', gatewayKeys.publicKey);
+const base64UrlAlphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+const mutateUnusedPadBits = value => {
+  const finalIndex = base64UrlAlphabet.indexOf(value.at(-1));
+  return value.slice(0, -1) + base64UrlAlphabet[(finalIndex & 0x30) | 1];
+};
+const invalidGatewayKeys = [
+  {...gatewayPublicKey, x: mutateUnusedPadBits(gatewayPublicKey.x)},
+  {...gatewayPublicKey, y: mutateUnusedPadBits(gatewayPublicKey.y)},
+  {...gatewayPublicKey, d: undefined},
+  {...gatewayPublicKey, alg: 'ES256'},
+  {...gatewayPublicKey, use: 'sig'},
+  {...gatewayPublicKey, key_ops: ['sign']},
+  {...gatewayPublicKey, ext: false},
+  {...gatewayPublicKey, unexpected: 'member'},
+  Object.create(gatewayPublicKey)
+];
+for (const invalidKey of invalidGatewayKeys) {
+  assert.throws(
+    () => globalThis.PalCloudEnvelope.validateGatewayPublicKey(invalidKey),
+    /gateway public key/i
+  );
+}
+assert.deepEqual(
+  globalThis.PalCloudEnvelope.validateGatewayPublicKey({...gatewayPublicKey, ext: true, key_ops: []}),
+  {...gatewayPublicKey, ext: true, key_ops: []}
+);
 const session = {
   bearer: 'Bearer seeded-secret-token',
   xJsUserAgent: 'seeded-x-js-user-agent'
@@ -128,6 +154,7 @@ const bridgeContext = {
     if (type === 'message') bridgeContext.__messageHandler = listener;
   },
   PalCloudEnvelope: {
+    validateGatewayPublicKey: globalThis.PalCloudEnvelope.validateGatewayPublicKey,
     encryptSession: async options => {
       encryptedInputs.push(options);
       return {version: 1, ciphertext: 'ciphertext-only'};
@@ -175,6 +202,11 @@ for (const invalid of [
   {...exportRequest, channel: 'wrong-channel', requestId: 'bad-channel'},
   {...exportRequest, gatewayPublicKey: {...gatewayPublicKey, crv: 'P-384'}, requestId: 'bad-curve'},
   {...exportRequest, gatewayPublicKey: {...gatewayPublicKey, x: 'not-a-coordinate'}, requestId: 'bad-coordinate'},
+  ...invalidGatewayKeys.map((gatewayPublicKey, index) => ({
+    ...exportRequest,
+    gatewayPublicKey,
+    requestId: `strict-jwk-${index}`
+  })),
   {...exportRequest, accountBinding: 'another-account', requestId: 'bad-account'},
   {...exportRequest, createdAt: Date.now() - 30001, requestId: 'stale'}
 ]) {

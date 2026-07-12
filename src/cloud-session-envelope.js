@@ -10,20 +10,6 @@
     return value;
   }
 
-  function publicP256Jwk(value) {
-    const coordinatePattern = /^[A-Za-z0-9_-]{43}$/;
-    if (!value || value.kty !== 'EC' || value.crv !== 'P-256') {
-      throw new TypeError('gatewayPublicKey must be an EC P-256 public JWK');
-    }
-    requireString(value.x, 'gatewayPublicKey.x');
-    requireString(value.y, 'gatewayPublicKey.y');
-    if (!coordinatePattern.test(value.x) || !coordinatePattern.test(value.y)) {
-      throw new TypeError('gatewayPublicKey must contain P-256 coordinates');
-    }
-    if (value.d !== undefined) throw new TypeError('gatewayPublicKey must not contain private key material');
-    return value;
-  }
-
   function base64Url(bytes) {
     let binary = '';
     const view = new Uint8Array(bytes);
@@ -31,6 +17,54 @@
       binary += String.fromCharCode(...view.subarray(offset, offset + 0x8000));
     }
     return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  }
+
+  function decodeCanonicalCoordinate(value) {
+    if (typeof value !== 'string' || !/^[A-Za-z0-9_-]+$/.test(value)) return null;
+    try {
+      const padded = value.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(value.length / 4) * 4, '=');
+      const binary = atob(padded);
+      const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
+      if (bytes.byteLength !== 32 || base64Url(bytes) !== value) return null;
+      return bytes;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function validateGatewayPublicKey(value) {
+    const allowed = new Set(['kty', 'crv', 'x', 'y', 'ext', 'key_ops']);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new TypeError('Gateway public key must be an EC P-256 public JWK');
+    }
+    if (Object.prototype.hasOwnProperty.call(value, 'd')) {
+      throw new TypeError('Gateway public key must not contain private key material');
+    }
+    if (Reflect.ownKeys(value).some(key => typeof key !== 'string' || !allowed.has(key))) {
+      throw new TypeError('Gateway public key contains unsupported members');
+    }
+    if (!['kty', 'crv', 'x', 'y'].every(key => Object.prototype.hasOwnProperty.call(value, key))) {
+      throw new TypeError('Gateway public key must define all public P-256 members');
+    }
+    if (value.kty !== 'EC' || value.crv !== 'P-256') {
+      throw new TypeError('Gateway public key must be an EC P-256 public JWK');
+    }
+    if (!decodeCanonicalCoordinate(value.x) || !decodeCanonicalCoordinate(value.y)) {
+      throw new TypeError('Gateway public key must contain canonical 32-byte P-256 coordinates');
+    }
+    if (Object.prototype.hasOwnProperty.call(value, 'ext') && value.ext !== true) {
+      throw new TypeError('Gateway public key ext must be true when present');
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(value, 'key_ops') &&
+      (!Array.isArray(value.key_ops) || value.key_ops.length !== 0)
+    ) {
+      throw new TypeError('Gateway public key key_ops must be empty when present');
+    }
+    const validated = {kty: 'EC', crv: 'P-256', x: value.x, y: value.y};
+    if (Object.prototype.hasOwnProperty.call(value, 'ext')) validated.ext = true;
+    if (Object.prototype.hasOwnProperty.call(value, 'key_ops')) validated.key_ops = [];
+    return validated;
   }
 
   function aadFor(envelope) {
@@ -44,7 +78,7 @@
 
   async function encryptSession(options) {
     const input = options || {};
-    const gatewayPublicKey = publicP256Jwk(input.gatewayPublicKey);
+    const gatewayPublicKey = validateGatewayPublicKey(input.gatewayPublicKey);
     const envelope = {
       version: VERSION,
       keyId: requireString(input.keyId, 'keyId'),
@@ -106,5 +140,5 @@
     };
   }
 
-  globalThis.PalCloudEnvelope = Object.freeze({encryptSession});
+  globalThis.PalCloudEnvelope = Object.freeze({encryptSession, validateGatewayPublicKey});
 })();

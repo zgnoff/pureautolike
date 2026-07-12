@@ -507,18 +507,6 @@
     return merged;
   }
 
-  function validGatewayPublicKey(value) {
-    const coordinatePattern = /^[A-Za-z0-9_-]{43}$/;
-    return !!(
-      value &&
-      value.kty === 'EC' &&
-      value.crv === 'P-256' &&
-      typeof value.x === 'string' && coordinatePattern.test(value.x) &&
-      typeof value.y === 'string' && coordinatePattern.test(value.y) &&
-      value.d === undefined
-    );
-  }
-
   function publishCloudSessionResult(requestId, result) {
     window.postMessage({
       source: 'pal-page-bridge',
@@ -542,16 +530,20 @@
       const bearerAccount = decodeBearerUserId(state.bearer);
       const createdAt = Number(data.createdAt);
       if (!state.bearer || !bearerAccount) throw new Error('Pure session is not ready');
-      if (!validGatewayPublicKey(data.gatewayPublicKey)) throw new Error('Invalid gateway public key');
       if (!accountBinding || accountBinding !== bearerAccount) throw new Error('Account binding mismatch');
       if (!Number.isSafeInteger(createdAt) || Math.abs(Date.now() - createdAt) > 30000) {
         throw new Error('Cloud session request expired');
       }
-      if (!globalThis.PalCloudEnvelope || typeof globalThis.PalCloudEnvelope.encryptSession !== 'function') {
+      if (
+        !globalThis.PalCloudEnvelope ||
+        typeof globalThis.PalCloudEnvelope.encryptSession !== 'function' ||
+        typeof globalThis.PalCloudEnvelope.validateGatewayPublicKey !== 'function'
+      ) {
         throw new Error('Cloud session encryption unavailable');
       }
+      const gatewayPublicKey = globalThis.PalCloudEnvelope.validateGatewayPublicKey(data.gatewayPublicKey);
       const envelope = await globalThis.PalCloudEnvelope.encryptSession({
-        gatewayPublicKey: data.gatewayPublicKey,
+        gatewayPublicKey,
         keyId: String(data.keyId || ''),
         accountBinding,
         createdAt,
