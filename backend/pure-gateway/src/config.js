@@ -1,3 +1,5 @@
+import {createECDH, timingSafeEqual} from 'node:crypto';
+
 const REQUIRED_ENV = Object.freeze([
   'CONTROL_PLANE_URL',
   'GATEWAY_ID',
@@ -18,10 +20,16 @@ function requiredString(env, name) {
   return value.trim();
 }
 
-function canonicalCoordinate(value) {
-  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]+$/.test(value)) return false;
+function decodeCanonical32(value) {
+  if (typeof value !== 'string' || value.length !== 43 || !/^[A-Za-z0-9_-]+$/.test(value)) return null;
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  if ((alphabet.indexOf(value.at(-1)) & 0x03) !== 0) return null;
   const bytes = Buffer.from(value, 'base64url');
-  return bytes.byteLength === 32 && bytes.toString('base64url') === value;
+  if (bytes.byteLength !== 32) {
+    bytes.fill(0);
+    return null;
+  }
+  return bytes;
 }
 
 function validatePrivateJwk(value) {
@@ -33,9 +41,6 @@ function validatePrivateJwk(value) {
     required.some(key => !Object.prototype.hasOwnProperty.call(value, key)) ||
     value.kty !== 'EC' ||
     value.crv !== 'P-256' ||
-    !canonicalCoordinate(value.x) ||
-    !canonicalCoordinate(value.y) ||
-    !canonicalCoordinate(value.d) ||
     (Object.prototype.hasOwnProperty.call(value, 'ext') && value.ext !== true) ||
     (Object.prototype.hasOwnProperty.call(value, 'key_ops') && (
       !Array.isArray(value.key_ops) ||
@@ -44,10 +49,36 @@ function validatePrivateJwk(value) {
     ))
   ) throw configError();
 
-  const validated = {kty: 'EC', crv: 'P-256', x: value.x, y: value.y, d: value.d};
-  if (Object.prototype.hasOwnProperty.call(value, 'ext')) validated.ext = true;
-  if (Object.prototype.hasOwnProperty.call(value, 'key_ops')) validated.key_ops = Object.freeze(['deriveBits']);
-  return Object.freeze(validated);
+  let xBytes;
+  let yBytes;
+  let dBytes;
+  let derived;
+  try {
+    xBytes = decodeCanonical32(value.x);
+    yBytes = decodeCanonical32(value.y);
+    dBytes = decodeCanonical32(value.d);
+    if (!xBytes || !yBytes || !dBytes) throw configError();
+
+    const ecdh = createECDH('prime256v1');
+    ecdh.setPrivateKey(dBytes);
+    derived = ecdh.getPublicKey(undefined, 'uncompressed');
+    if (derived.byteLength !== 65 || derived[0] !== 0x04) throw configError();
+    const xMatches = timingSafeEqual(xBytes, derived.subarray(1, 33));
+    const yMatches = timingSafeEqual(yBytes, derived.subarray(33, 65));
+    if (!xMatches || !yMatches) throw configError();
+
+    const validated = {kty: 'EC', crv: 'P-256', x: value.x, y: value.y, d: value.d};
+    if (Object.prototype.hasOwnProperty.call(value, 'ext')) validated.ext = true;
+    if (Object.prototype.hasOwnProperty.call(value, 'key_ops')) validated.key_ops = Object.freeze(['deriveBits']);
+    return Object.freeze(validated);
+  } catch (_) {
+    throw configError();
+  } finally {
+    xBytes?.fill(0);
+    yBytes?.fill(0);
+    dBytes?.fill(0);
+    derived?.fill(0);
+  }
 }
 
 export function loadConfig(env = process.env) {

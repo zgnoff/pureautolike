@@ -145,6 +145,30 @@ test('rejects malformed, public, wrong-curve, noncanonical, and incompatible pri
   }
 });
 
+test('rejects canonical off-curve coordinates and private scalars that do not match the public point', async () => {
+  const valid = await generatedPrivateJwk();
+  const unrelated = await generatedPrivateJwk();
+  const mutateCanonical = value => {
+    const bytes = Buffer.from(value, 'base64url');
+    bytes[0] ^= 0x01;
+    return bytes.toString('base64url');
+  };
+  const invalidValues = [
+    {...valid, x: mutateCanonical(valid.x)},
+    {...valid, y: mutateCanonical(valid.y)},
+    {...valid, d: unrelated.d}
+  ];
+  for (const invalid of invalidValues) {
+    assert.throws(
+      () => loadConfig(configEnv(invalid)),
+      error => error.code === 'INVALID_CONFIG' &&
+        !String(error).includes(valid.d) &&
+        !String(error).includes(unrelated.d)
+    );
+  }
+  assert.deepEqual(loadConfig(configEnv(valid)).privateJwk, valid);
+});
+
 test('decrypts the browser Web Crypto envelope with the gateway private JWK', async () => {
   const fixture = await envelopeFixture();
   const session = await decryptSessionEnvelope(fixture.envelope, {
