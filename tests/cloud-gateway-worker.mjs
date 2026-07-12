@@ -2,6 +2,8 @@ import {readFile} from 'node:fs/promises';
 import {dirname, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {spawnSync} from 'node:child_process';
+import {createTelegramBridge} from '../backend/license-worker/src/telegram-bridge.js';
+import {createFakeD1} from './helpers/fake-d1.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const schema = await readFile(resolve(root, 'backend/license-worker/schema.sql'), 'utf8');
@@ -276,5 +278,218 @@ INSERT INTO bridge_media_transfers
   (transfer_id, account_id, command_id, media_kind, mime_type, byte_length, content_hash, expires_at)
 VALUES ('transfer-valid', 'account-a', 'command-a', 'photo', 'image/jpeg', 10, 'content-hash', '2026-07-12T13:00:00Z');
 `, 'valid same-account cloud references must load with SQLite foreign keys enabled');
+
+const cloudNow = new Date('2026-07-12T12:00:00.000Z');
+const cloudBridge = createTelegramBridge({
+  now: () => cloudNow,
+  randomUUID: (() => {
+    let counter = 900;
+    return () => `00000000-0000-4000-8000-${String(++counter).padStart(12, '0')}`;
+  })()
+});
+const cloudDb = createFakeD1();
+const cloudToken = 'cloud-device-session-token';
+let accountStatus = 'active';
+let deviceStatus = 'active';
+let consentWarningVersion = '';
+let storedCloudSession = null;
+cloudDb.when('FROM bridge_sessions s', () => ({
+  account_id: 'account-cloud-1',
+  device_id: 'device-cloud-1',
+  session_expires_at: '2026-07-12T12:10:00.000Z',
+  device_status: deviceStatus,
+  account_status: accountStatus,
+  telegram_chat_id: '12345'
+}));
+cloudDb.when('FROM bridge_cloud_consents', () => consentWarningVersion ? ({
+  warning_version: consentWarningVersion,
+  accepted_at: '2026-07-12T12:00:00.000Z'
+}) : null);
+cloudDb.when('INSERT INTO bridge_cloud_consents', ({params}) => {
+  consentWarningVersion = String(params[3]);
+  return {success: true, meta: {changes: 1}};
+});
+cloudDb.when('FROM bridge_cloud_sessions', () => storedCloudSession);
+cloudDb.when('INSERT INTO bridge_cloud_sessions', ({params}) => {
+  storedCloudSession = {
+    id: params[0],
+    active_device_id: params[2],
+    envelope_version: params[3],
+    envelope_ciphertext: params[4],
+    gateway_key_id: params[5],
+    credential_fingerprint_hash: params[6],
+    status: 'pending',
+    created_at: '2026-07-12T12:00:00.000Z',
+    rotated_at: null,
+    last_used_at: null
+  };
+  return {success: true, meta: {changes: 1}};
+});
+cloudDb.when('UPDATE bridge_cloud_sessions', ({params}) => {
+  if (storedCloudSession) {
+    storedCloudSession = {
+      ...storedCloudSession,
+      active_device_id: params[0],
+      envelope_version: params[1],
+      envelope_ciphertext: params[2],
+      gateway_key_id: params[3],
+      credential_fingerprint_hash: params[4],
+      status: 'pending',
+      rotated_at: '2026-07-12T12:00:00.000Z',
+      last_used_at: null
+    };
+  }
+  return {success: true, meta: {changes: 1}};
+});
+cloudDb.when('DELETE FROM bridge_cloud_sessions', () => {
+  storedCloudSession = null;
+  return {success: true, meta: {changes: 1}};
+});
+
+const gatewayPublicJwk = {
+  kty: 'EC',
+  crv: 'P-256',
+  x: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+  y: 'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBQ'
+};
+const cloudEnv = (overrides = {}) => ({
+  DB: cloudDb,
+  GATEWAY_PUBLIC_JWK: JSON.stringify(gatewayPublicJwk),
+  GATEWAY_KEY_ID: 'gateway-key-2026-07',
+  CLOUD_TEST_ENABLED: 'true',
+  CLOUD_TEST_ACCOUNT_IDS: 'account-cloud-1,account-other',
+  CLOUD_WARNING_VERSION: 'cloud-risk-v1',
+  ...overrides
+});
+const cloudRequest = (path, {method = 'GET', body, token = cloudToken} = {}) => new Request(
+  `https://worker.example${path}`,
+  {
+    method,
+    headers: {
+      ...(token ? {Authorization: `Bearer ${token}`} : {}),
+      ...(body === undefined ? {} : {'Content-Type': 'application/json'})
+    },
+    ...(body === undefined ? {} : {body: typeof body === 'string' ? body : JSON.stringify(body)})
+  }
+);
+const callCloud = (path, options, env = cloudEnv()) => cloudBridge.handle(cloudRequest(path, options), env);
+const validEnvelope = (overrides = {}) => ({
+  version: 1,
+  keyId: 'gateway-key-2026-07',
+  accountBinding: 'account-cloud-1',
+  createdAt: cloudNow.getTime(),
+  ephemeralPublicKey: gatewayPublicJwk,
+  salt: 'A'.repeat(43),
+  iv: 'B'.repeat(16),
+  ciphertext: 'C'.repeat(64),
+  ...overrides
+});
+
+const configResponse = await callCloud('/v1/cloud/config');
+assert(configResponse?.status === 200, 'authenticated active device must receive cloud config');
+const config = await configResponse.json();
+assert(config.ok && config.test_mode === true, 'cloud config must identify test mode');
+assert(config.account_binding === 'account-cloud-1', 'cloud config must bind envelopes to the authenticated account');
+assert(config.warning_version === 'cloud-risk-v1', 'cloud config must return the exact warning version');
+assert(config.gateway_key_id === 'gateway-key-2026-07', 'cloud config must expose the configured key id');
+assert(JSON.stringify(config.gateway_public_jwk) === JSON.stringify(gatewayPublicJwk), 'cloud config must expose the configured public JWK');
+
+const missingAuthResponse = await callCloud('/v1/cloud/config', {token: ''});
+assert(missingAuthResponse.status === 401, 'cloud config must require a device session');
+
+const disabledResponse = await callCloud('/v1/cloud/config', {}, cloudEnv({CLOUD_TEST_ENABLED: 'false'}));
+assert(disabledResponse.status === 403 && (await disabledResponse.json()).code === 'CLOUD_TEST_DISABLED', 'disabled cloud test mode must use CLOUD_TEST_DISABLED');
+const deniedAccountResponse = await callCloud('/v1/cloud/config', {}, cloudEnv({CLOUD_TEST_ACCOUNT_IDS: 'account-other'}));
+assert(deniedAccountResponse.status === 403 && (await deniedAccountResponse.json()).code === 'CLOUD_TEST_DISABLED', 'non-allowlisted account must use CLOUD_TEST_DISABLED');
+
+accountStatus = 'suspended';
+const inactiveResponse = await callCloud('/v1/cloud/status');
+assert(inactiveResponse.status === 403 && (await inactiveResponse.json()).code === 'ACCOUNT_INACTIVE', 'inactive account must use ACCOUNT_INACTIVE');
+accountStatus = 'active';
+deviceStatus = 'revoked';
+assert((await callCloud('/v1/cloud/status')).status === 403, 'inactive device must not use cloud routes');
+deviceStatus = 'active';
+
+const preConsentUpload = await callCloud('/v1/cloud/session', {
+  method: 'PUT',
+  body: {envelope: validEnvelope(), credential_fingerprint_hash: 'fingerprint-hash-1'}
+});
+assert(preConsentUpload.status === 403 && (await preConsentUpload.json()).code === 'CONSENT_REQUIRED', 'upload before exact consent must use CONSENT_REQUIRED');
+
+const wrongWarningResponse = await callCloud('/v1/cloud/consent', {
+  method: 'POST',
+  body: {warning_version: 'cloud-risk-old'}
+});
+assert(wrongWarningResponse.status === 400 && (await wrongWarningResponse.json()).code === 'CONSENT_REQUIRED', 'consent must require the configured warning version');
+const consentResponse = await callCloud('/v1/cloud/consent', {
+  method: 'POST',
+  body: {warning_version: 'cloud-risk-v1'}
+});
+assert(consentResponse.status === 200 && (await consentResponse.json()).warning_version === 'cloud-risk-v1', 'exact warning consent must be recorded');
+
+for (const envelope of [
+  validEnvelope({version: 2}),
+  validEnvelope({accountBinding: 'account-other'}),
+  validEnvelope({ephemeralPublicKey: {...gatewayPublicJwk, crv: 'P-384'}}),
+  validEnvelope({ephemeralPublicKey: {...gatewayPublicJwk, d: 'private-key-material'}}),
+  validEnvelope({ephemeralPublicKey: {...gatewayPublicJwk, x: 'short'}}),
+  validEnvelope({salt: 'not base64!'}),
+  validEnvelope({iv: 'tiny'}),
+  validEnvelope({ciphertext: ''})
+]) {
+  const response = await callCloud('/v1/cloud/session', {
+    method: 'PUT',
+    body: {envelope, credential_fingerprint_hash: 'fingerprint-hash-1'}
+  });
+  assert(response.status === 400 && (await response.json()).code === 'INVALID_ENVELOPE', 'malformed or cross-account envelope must use INVALID_ENVELOPE');
+}
+const wrongKeyResponse = await callCloud('/v1/cloud/session', {
+  method: 'PUT',
+  body: {envelope: validEnvelope({keyId: 'gateway-key-old'}), credential_fingerprint_hash: 'fingerprint-hash-1'}
+});
+assert(wrongKeyResponse.status === 409 && (await wrongKeyResponse.json()).code === 'GATEWAY_KEY_MISMATCH', 'wrong gateway key binding must use GATEWAY_KEY_MISMATCH');
+
+const oversizedEnvelopeResponse = await callCloud('/v1/cloud/session', {
+  method: 'PUT',
+  body: {envelope: validEnvelope({ciphertext: 'C'.repeat(65537)}), credential_fingerprint_hash: 'fingerprint-hash-1'}
+});
+assert(oversizedEnvelopeResponse.status === 413 && (await oversizedEnvelopeResponse.json()).code === 'INVALID_ENVELOPE', 'serialized envelope over 64 KiB must use INVALID_ENVELOPE');
+const oversizedBodyResponse = await callCloud('/v1/cloud/session', {
+  method: 'PUT',
+  body: JSON.stringify({padding: 'x'.repeat(65536)})
+});
+assert(oversizedBodyResponse.status === 413 && (await oversizedBodyResponse.json()).code === 'INVALID_ENVELOPE', 'cloud request body over 64 KiB must use INVALID_ENVELOPE');
+
+const createdResponse = await callCloud('/v1/cloud/session', {
+  method: 'PUT',
+  body: {envelope: validEnvelope(), credential_fingerprint_hash: 'fingerprint-hash-1'}
+});
+assert(createdResponse.status === 201, 'first valid cloud session upload must return 201');
+const created = await createdResponse.json();
+assert(created.status === 'pending' && !JSON.stringify(created).includes('C'.repeat(32)), 'upload response must be redacted');
+const originalSessionId = storedCloudSession.id;
+
+const rotatedResponse = await callCloud('/v1/cloud/session', {
+  method: 'PUT',
+  body: {envelope: validEnvelope({ciphertext: 'D'.repeat(64)}), credential_fingerprint_hash: 'fingerprint-hash-2'}
+});
+assert(rotatedResponse.status === 200, 'rotating a cloud session must return 200');
+assert(storedCloudSession.id === originalSessionId, 'rotation must preserve the cloud session identity');
+assert(storedCloudSession.envelope_ciphertext.includes('D'.repeat(32)), 'rotation must replace the stored envelope');
+assert(cloudDb.calls.some(call => call.sql.includes('UPDATE bridge_cloud_sessions') && call.sql.includes('rotated_at = CURRENT_TIMESTAMP')), 'rotation must record rotated_at');
+
+const statusResponse = await callCloud('/v1/cloud/status');
+const status = await statusResponse.json();
+assert(statusResponse.status === 200 && status.configured === true && status.status === 'pending', 'status must report configured cloud state');
+assert(status.gateway_key_id === 'gateway-key-2026-07' && status.credential_fingerprint_hash === 'fingerprint-hash-2', 'status must expose only redacted metadata');
+assert(!Object.hasOwn(status, 'envelope_ciphertext') && !Object.hasOwn(status, 'ciphertext') && !JSON.stringify(status).includes('D'.repeat(32)), 'status must never return stored ciphertext');
+
+const deleteResponse = await callCloud('/v1/cloud/session', {method: 'DELETE'});
+assert(deleteResponse.status === 200 && (await deleteResponse.json()).configured === false, 'deactivation must report unconfigured');
+for (const table of ['bridge_gateway_leases', 'bridge_media_transfers', 'bridge_delivery_queue', 'bridge_sync_state', 'bridge_cloud_sessions']) {
+  assert(cloudDb.calls.some(call => call.sql.includes(`DELETE FROM ${table}`)), `deactivation must clean ${table}`);
+}
+const repeatedDeleteResponse = await callCloud('/v1/cloud/session', {method: 'DELETE'});
+assert(repeatedDeleteResponse.status === 200 && (await repeatedDeleteResponse.json()).configured === false, 'deactivation must be idempotent');
 
 console.log('cloud gateway schema contract passed');
