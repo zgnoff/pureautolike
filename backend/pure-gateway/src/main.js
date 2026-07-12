@@ -8,11 +8,21 @@ const POLL_INTERVAL_MS = 5_000;
 
 function delay(milliseconds, signal) {
   return new Promise(resolve => {
-    const timer = setTimeout(resolve, milliseconds);
-    signal?.addEventListener('abort', () => {
+    let settled = false;
+    let timer;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener('abort', finish);
       resolve();
-    }, {once: true});
+    };
+    timer = setTimeout(finish, milliseconds);
+    if (signal?.aborted) {
+      finish();
+    } else {
+      signal?.addEventListener('abort', finish, {once: true});
+    }
   });
 }
 
@@ -34,7 +44,7 @@ export async function runGateway(options = {}) {
     keyId: config.gatewayKeyId
   });
   const signal = options.signal;
-  const intervalMs = Math.max(100, Number(options.pollIntervalMs) || POLL_INTERVAL_MS);
+  const intervalMs = Math.max(1, Number(options.pollIntervalMs) || POLL_INTERVAL_MS);
 
   while (!signal?.aborted) {
     try {

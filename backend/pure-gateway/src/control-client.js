@@ -30,22 +30,40 @@ export function signRequest(secret, request) {
   return createHmac('sha256', secret).update(canonicalRequest(request)).digest('hex');
 }
 
+async function cancelBody(body) {
+  if (!body) return;
+  try {
+    await body.cancel();
+  } catch (_) {
+    // Cancellation is best-effort; callers still receive the stable primary error.
+  }
+}
+
 async function readBounded(response, maximumBytes) {
   const declared = Number(response.headers.get('content-length'));
   if (Number.isFinite(declared) && declared > maximumBytes) {
+    await cancelBody(response.body);
     throw new ControlClientError('CONTROL_RESPONSE_TOO_LARGE');
   }
   if (!response.body) return new Uint8Array();
   const reader = response.body.getReader();
   const chunks = [];
   let length = 0;
+  let finished = false;
+  let cancelled = false;
   try {
     while (true) {
       const {done, value} = await reader.read();
-      if (done) break;
+      if (done) {
+        finished = true;
+        break;
+      }
       length += value.byteLength;
       if (length > maximumBytes) {
-        await reader.cancel();
+        try {
+          await reader.cancel();
+        } catch (_) {}
+        cancelled = true;
         throw new ControlClientError('CONTROL_RESPONSE_TOO_LARGE');
       }
       chunks.push(value);
@@ -57,6 +75,13 @@ async function readBounded(response, maximumBytes) {
       offset += chunk.byteLength;
     }
     return output;
+  } catch (error) {
+    if (!finished && !cancelled) {
+      try {
+        await reader.cancel();
+      } catch (_) {}
+    }
+    throw error;
   } finally {
     for (const chunk of chunks) chunk.fill(0);
     reader.releaseLock();
@@ -115,7 +140,7 @@ export function createControlClient(options = {}) {
         signal: controller.signal
       });
       if (!response.ok) {
-        await response.body?.cancel();
+        await cancelBody(response.body);
         throw new ControlClientError('CONTROL_HTTP_ERROR', response.status);
       }
       return parseJson(await readBounded(response, maxResponseBytes));

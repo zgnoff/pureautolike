@@ -18,6 +18,38 @@ function requiredString(env, name) {
   return value.trim();
 }
 
+function canonicalCoordinate(value) {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]+$/.test(value)) return false;
+  const bytes = Buffer.from(value, 'base64url');
+  return bytes.byteLength === 32 && bytes.toString('base64url') === value;
+}
+
+function validatePrivateJwk(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw configError();
+  const allowed = new Set(['kty', 'crv', 'x', 'y', 'd', 'ext', 'key_ops']);
+  const required = ['kty', 'crv', 'x', 'y', 'd'];
+  if (
+    Reflect.ownKeys(value).some(key => typeof key !== 'string' || !allowed.has(key)) ||
+    required.some(key => !Object.prototype.hasOwnProperty.call(value, key)) ||
+    value.kty !== 'EC' ||
+    value.crv !== 'P-256' ||
+    !canonicalCoordinate(value.x) ||
+    !canonicalCoordinate(value.y) ||
+    !canonicalCoordinate(value.d) ||
+    (Object.prototype.hasOwnProperty.call(value, 'ext') && value.ext !== true) ||
+    (Object.prototype.hasOwnProperty.call(value, 'key_ops') && (
+      !Array.isArray(value.key_ops) ||
+      value.key_ops.length !== 1 ||
+      value.key_ops[0] !== 'deriveBits'
+    ))
+  ) throw configError();
+
+  const validated = {kty: 'EC', crv: 'P-256', x: value.x, y: value.y, d: value.d};
+  if (Object.prototype.hasOwnProperty.call(value, 'ext')) validated.ext = true;
+  if (Object.prototype.hasOwnProperty.call(value, 'key_ops')) validated.key_ops = Object.freeze(['deriveBits']);
+  return Object.freeze(validated);
+}
+
 export function loadConfig(env = process.env) {
   const values = Object.fromEntries(REQUIRED_ENV.map(name => [name, requiredString(env, name)]));
   let controlPlaneUrl;
@@ -28,18 +60,17 @@ export function loadConfig(env = process.env) {
       throw configError();
     }
     controlPlaneUrl = parsedUrl.href.replace(/\/$/, '');
-    privateJwk = JSON.parse(values.GATEWAY_PRIVATE_JWK);
+    privateJwk = validatePrivateJwk(JSON.parse(values.GATEWAY_PRIVATE_JWK));
   } catch (_) {
     throw configError();
   }
-  if (!privateJwk || typeof privateJwk !== 'object' || Array.isArray(privateJwk)) throw configError();
   if (Buffer.byteLength(values.GATEWAY_HMAC_SECRET, 'utf8') < 32) throw configError();
 
   return Object.freeze({
     controlPlaneUrl,
     gatewayId: values.GATEWAY_ID,
     hmacSecret: values.GATEWAY_HMAC_SECRET,
-    privateJwk: Object.freeze({...privateJwk}),
+    privateJwk,
     gatewayKeyId: values.GATEWAY_KEY_ID
   });
 }

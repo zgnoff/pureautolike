@@ -11,6 +11,7 @@ import {
   signRequest
 } from '../src/control-client.js';
 import {ConnectorManager} from '../src/connector-manager.js';
+import {runGateway} from '../src/main.js';
 
 const encoder = new TextEncoder();
 const SEEDED_BEARER = 'Bearer gateway-foundation-seeded-token';
@@ -20,6 +21,25 @@ const ACCOUNT_ID = 'account-fixture-42';
 
 function base64Url(bytes) {
   return Buffer.from(bytes).toString('base64url');
+}
+
+async function generatedPrivateJwk() {
+  const keys = await webcrypto.subtle.generateKey(
+    {name: 'ECDH', namedCurve: 'P-256'},
+    true,
+    ['deriveBits']
+  );
+  return webcrypto.subtle.exportKey('jwk', keys.privateKey);
+}
+
+function configEnv(privateJwk) {
+  return {
+    CONTROL_PLANE_URL: 'https://control.example.test/',
+    GATEWAY_ID: 'gateway-1',
+    GATEWAY_HMAC_SECRET: 'a'.repeat(32),
+    GATEWAY_PRIVATE_JWK: JSON.stringify(privateJwk),
+    GATEWAY_KEY_ID: KEY_ID
+  };
 }
 
 async function envelopeFixture({accountBinding = ACCOUNT_ID, keyId = KEY_ID, keyPair} = {}) {
@@ -81,15 +101,9 @@ async function envelopeFixture({accountBinding = ACCOUNT_ID, keyId = KEY_ID, key
   };
 }
 
-test('loads exactly the required gateway secrets and rejects missing values safely', () => {
-  const privateJwk = {kty: 'EC', crv: 'P-256', x: 'x', y: 'y', d: 'seeded-private-value'};
-  const env = {
-    CONTROL_PLANE_URL: 'https://control.example.test/',
-    GATEWAY_ID: 'gateway-1',
-    GATEWAY_HMAC_SECRET: 'a'.repeat(32),
-    GATEWAY_PRIVATE_JWK: JSON.stringify(privateJwk),
-    GATEWAY_KEY_ID: KEY_ID
-  };
+test('loads exactly the required gateway secrets and a generated P-256 private JWK', async () => {
+  const privateJwk = await generatedPrivateJwk();
+  const env = configEnv(privateJwk);
   const config = loadConfig(env);
   assert.equal(config.controlPlaneUrl, 'https://control.example.test');
   assert.equal(config.gatewayId, 'gateway-1');
@@ -100,6 +114,34 @@ test('loads exactly the required gateway secrets and rejects missing values safe
   );
   for (const name of Object.keys(env)) {
     assert.throws(() => loadConfig({...env, [name]: ''}), {code: 'INVALID_CONFIG'});
+  }
+});
+
+test('rejects malformed, public, wrong-curve, noncanonical, and incompatible private JWKs safely', async () => {
+  const valid = await generatedPrivateJwk();
+  const publicOnly = {...valid};
+  delete publicOnly.d;
+  const finalAlphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  const finalIndex = finalAlphabet.indexOf(valid.x.at(-1));
+  const noncanonicalX = valid.x.slice(0, -1) + finalAlphabet[(finalIndex & 0x30) | 1];
+  const invalidValues = [
+    [],
+    publicOnly,
+    {...valid, crv: 'P-384'},
+    {...valid, x: noncanonicalX},
+    {...valid, y: base64Url(randomBytes(31))},
+    {...valid, d: SEEDED_BEARER},
+    {...valid, alg: 'ES256'},
+    {...valid, ext: false},
+    {...valid, key_ops: ['sign']}
+  ];
+  for (const invalid of invalidValues) {
+    assert.throws(
+      () => loadConfig(configEnv(invalid)),
+      error => error.code === 'INVALID_CONFIG' &&
+        !String(error).includes(SEEDED_BEARER) &&
+        !String(error).includes(valid.d)
+    );
   }
 });
 
@@ -225,6 +267,76 @@ test('bounds control-plane responses and timeouts without echoing response bodie
     })
   });
   await assert.rejects(timeout.pollLeases(), {code: 'CONTROL_TIMEOUT'});
+});
+
+test('cancels response bodies on declared oversize and HTTP error paths', async () => {
+  let oversizeCancelled = 0;
+  const oversizeBody = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode('{"leases":[]}'));
+    },
+    cancel() {
+      oversizeCancelled += 1;
+    }
+  });
+  const oversized = createControlClient({
+    controlPlaneUrl: 'https://control.example.test',
+    gatewayId: 'gateway-1',
+    hmacSecret: 'c'.repeat(32),
+    maxResponseBytes: 32,
+    fetchImpl: async () => new Response(oversizeBody, {
+      status: 200,
+      headers: {'content-length': '1024'}
+    })
+  });
+  await assert.rejects(oversized.pollLeases(), {code: 'CONTROL_RESPONSE_TOO_LARGE'});
+  assert.equal(oversizeCancelled, 1, 'declared oversized response body must be cancelled');
+
+  let httpErrorCancelled = 0;
+  const errorBody = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(SEEDED_BEARER));
+    },
+    cancel() {
+      httpErrorCancelled += 1;
+    }
+  });
+  const unavailable = createControlClient({
+    controlPlaneUrl: 'https://control.example.test',
+    gatewayId: 'gateway-1',
+    hmacSecret: 'e'.repeat(32),
+    fetchImpl: async () => new Response(errorBody, {status: 503})
+  });
+  await assert.rejects(unavailable.pollLeases(), {code: 'CONTROL_HTTP_ERROR'});
+  assert.equal(httpErrorCancelled, 1, 'HTTP error response body must be cancelled');
+});
+
+test('repeated gateway cycles do not retain abort listeners between delays', async () => {
+  const listeners = new Set();
+  const signal = {
+    aborted: false,
+    addEventListener(type, listener) {
+      if (type === 'abort') listeners.add(listener);
+    },
+    removeEventListener(type, listener) {
+      if (type === 'abort') listeners.delete(listener);
+    }
+  };
+  let cycles = 0;
+  const client = {
+    async pollLeases() {
+      return [];
+    },
+    async heartbeat() {
+      cycles += 1;
+      if (cycles === 25) signal.aborted = true;
+      return {ok: true};
+    }
+  };
+  const manager = {async reconcile() { return []; }};
+  await runGateway({config: {}, client, manager, signal, pollIntervalMs: 1});
+  assert.equal(cycles, 25);
+  assert.equal(listeners.size, 0, 'resolved delays must remove their abort listeners');
 });
 
 test('reconciles only foundation connector states and never exposes decrypted credentials', async () => {
